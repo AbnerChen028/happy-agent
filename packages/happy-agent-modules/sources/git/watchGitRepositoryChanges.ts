@@ -16,8 +16,7 @@ const COMMON_ENTRIES = new Set(["config", "packed-refs"]);
 
 export type GitRepositoryChange =
     | { readonly kind: "armed" }
-    | { readonly entry?: string; readonly kind: "git" | "refs" }
-    | { readonly kind: "worktree"; readonly path?: string };
+    | { readonly entry?: string; readonly kind: "git" | "refs" };
 
 export interface GitRepositoryWatchOptions {
     commonDirectory: string;
@@ -44,10 +43,10 @@ interface SharedGitWatchTarget {
 }
 
 /**
- * One module-owned pool of filesystem watchers.
+ * One module-owned pool of Git metadata watchers.
  *
- * Worktrees have distinct control directories and working trees, but share their common Git
- * directory and refs. Pooling by physical directory means those shared locations have one
+ * Working-tree contents are watched separately, by the working-tree watcher. Worktrees have
+ * distinct control directories, but share their common Git directory and refs. Pooling by physical directory means those shared locations have one
  * `fs.watch` handle whose events fan out to the interested repository trackers.
  */
 export class GitRepositoryWatchRegistry {
@@ -174,7 +173,7 @@ export function watchGitRepositoryChanges(
 export interface GitWatchTarget {
     accept?: (entry: string) => boolean;
     directory: string;
-    kind: "git" | "refs" | "worktree";
+    kind: "git" | "refs";
     recursive: boolean;
 }
 
@@ -211,9 +210,6 @@ export function gitWatchTargets(options: {
         kind: "refs",
         recursive: true,
     });
-    if (supportsRecursiveWorktreeWatch()) {
-        targets.push({ directory: options.path, kind: "worktree", recursive: true });
-    }
     return targets;
 }
 
@@ -221,14 +217,12 @@ export function gitWatchTargetKey(target: Pick<GitWatchTarget, "directory" | "re
     return `${target.recursive ? "recursive" : "shallow"}:${target.directory}`;
 }
 
+/** Whether Node's own `fs.watch` is recursive in the kernel rather than emulated per directory. */
 export function supportsRecursiveWorktreeWatch(): boolean {
     return process.platform === "darwin" || process.platform === "win32";
 }
 
 function changeFor(kind: GitWatchTarget["kind"], entry: string): GitRepositoryChange {
-    if (kind === "worktree") {
-        return entry.length === 0 ? { kind } : { kind, path: entry };
-    }
     return entry.length === 0 ? { kind } : { entry, kind };
 }
 

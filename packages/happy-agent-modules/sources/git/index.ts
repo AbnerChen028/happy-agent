@@ -49,6 +49,11 @@ export { workspaceBaseSchema, type WorkspaceBase } from "./resolveWorkspaceBase.
 export { GitRevisionFileTooLargeError, type GitRevisionFile } from "./readGitFileAtRevision.js";
 export { type GitWorkingTreeFiles } from "./listGitWorkingTreeFiles.js";
 export { type UntrackedFileCount } from "./countUntrackedFileLines.js";
+export {
+    type WorkingTreeChange,
+    type WorkingTreeChangeKind,
+    type WorkingTreeObserver,
+} from "./impl/WorkingTreeWatcher.js";
 export { type HostingRepository } from "./parseHostingRepository.js";
 export {
     type GitAuthentication,

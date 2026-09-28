@@ -48,6 +48,7 @@ interface BinaryAssets {
     montyNativeRelativePath: string;
     montyWorkerRelativePath: string;
     montyWorkerVariables: string[];
+    parcelWatcherRelativePath: string;
     supervisorGroups: Partial<
         Record<BinaryTarget["key"], { relativePath: string; variables: string[] }>
     >;
@@ -270,6 +271,8 @@ function resolveBinaryAssets(target: BinaryTarget, tailcatSource: string): Binar
     const montyRequire = createRequire(join(montyRoot, "package.json"));
     const fffRoot = dependencyRoot("@slopus/happy-agent-modules", "@ff-labs/fff-node");
     const fffRequire = createRequire(join(fffRoot, "package.json"));
+    const parcelWatcherRoot = dependencyRoot("@slopus/happy-agent-modules", "@parcel/watcher");
+    const parcelWatcherRequire = createRequire(join(parcelWatcherRoot, "package.json"));
     const computeRoot = dependencyRoot(
         "@slopus/happy-agent-modules",
         "@slopus/happy-agent-compute",
@@ -290,6 +293,8 @@ function resolveBinaryAssets(target: BinaryTarget, tailcatSource: string): Binar
     const ffiPackage = `@yuuang/ffi-rs-${nativeSuffix}`;
     const fffPackage = `@ff-labs/fff-bin-${target.platform === "win32" ? target.key : nativeSuffix}`;
     const claudePackage = `@anthropic-ai/claude-agent-sdk-${target.key}`;
+    // Linux binaries target glibc, like every other embedded native library.
+    const parcelWatcherPackage = `@parcel/watcher-${target.key}${target.platform === "linux" ? "-glibc" : ""}`;
 
     const libsqlSource =
         target.platform === "win32"
@@ -305,6 +310,7 @@ function resolveBinaryAssets(target: BinaryTarget, tailcatSource: string): Binar
         target.platform === "win32"
             ? join(happyAgentRoot, "native", "target", "win32-x64", "fff_c.dll")
             : resolveRequired(fffRequire, fffPackage);
+    const parcelWatcherSource = resolveRequired(parcelWatcherRequire, parcelWatcherPackage);
     const claudeSource = resolveRequired(
         providersRequire,
         `${claudePackage}/claude${executableSuffix}`,
@@ -355,6 +361,12 @@ export const { getQuickJS } = QJS;
         asset("montyWorkerAsset", montyWorkerSource, `monty${executableSuffix}`, true),
         asset("ffiAsset", ffiSource, basename(ffiSource)),
         asset("fffAsset", fffSource, basename(fffSource)),
+        asset("parcelWatcherAsset", parcelWatcherSource, "watcher.node"),
+        asset(
+            "parcelWatcherLicenseAsset",
+            join(dirname(parcelWatcherSource), "LICENSE"),
+            "LICENSE.parcel-watcher",
+        ),
         asset("claudeAsset", claudeSource, `claude${executableSuffix}`, true),
         asset("ghosttyWasmAsset", ghosttySource, "ghostty-vt.wasm"),
         asset("tailcatAsset", tailcatSource, `tailcat${executableSuffix}`, true),
@@ -507,6 +519,7 @@ export const { getQuickJS } = QJS;
             target.platform === "win32"
                 ? ["montyWorkerAsset", "montyLicenseAsset"]
                 : ["montyWorkerAsset"],
+        parcelWatcherRelativePath: "watcher.node",
         supervisorGroups,
         tailcatRelativePath: `tailcat${executableSuffix}`,
     };
@@ -548,6 +561,7 @@ export function resolveSourceAdapters(target: BinaryTarget): Map<string, SourceA
     );
     const fffRoot = dependencyRoot("@slopus/happy-agent-modules", "@ff-labs/fff-node");
     const ffiRoot = packageDependencyRoot(fffRoot, "ffi-rs");
+    const parcelWatcherRoot = dependencyRoot("@slopus/happy-agent-modules", "@parcel/watcher");
     const computeRoot = dependencyRoot(
         "@slopus/happy-agent-modules",
         "@slopus/happy-agent-compute",
@@ -577,6 +591,17 @@ export function resolveSourceAdapters(target: BinaryTarget): Map<string, SourceA
         },
     );
 
+    addAdapter(adapters, join(parcelWatcherRoot, "index.js"), {
+        name: "Parcel watcher native loader",
+        required: true,
+        adapt: (source) =>
+            replaceOnce(
+                source,
+                "  binding = require(name);",
+                `  binding = require(${JSON.stringify(VIRTUAL_ASSETS_MODULE)}).loadParcelWatcherNative();`,
+                "Parcel watcher native loader",
+            ),
+    });
     addAdapter(adapters, join(libsqlRoot, "index.js"), {
         name: "libSQL native loader",
         required: true,
@@ -858,6 +883,9 @@ function loadNative(name, files, relativePath) {
 }
 export function loadLibsqlNative() {
     return loadNative("libsql", ${files(binaryAssets.assets.filter((entry) => entry.variable === "libsqlAsset" || entry.variable.startsWith("libsqlLicense")).map((entry) => entry.variable))}, ${JSON.stringify(binaryAssets.libsqlRelativePath)});
+}
+export function loadParcelWatcherNative() {
+    return loadNative("parcel-watcher", ${files(["parcelWatcherAsset", "parcelWatcherLicenseAsset"])}, ${JSON.stringify(binaryAssets.parcelWatcherRelativePath)});
 }
 export function loadMontyNative() {
     return loadNative("monty-native", ${files(["montyNativeAsset"])}, ${JSON.stringify(binaryAssets.montyNativeRelativePath)});

@@ -1,13 +1,24 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { rm, writeFile } from "node:fs/promises";
+import { rm, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { scanGitRepository } from "../../sources/git/scanGitRepository.js";
-import { runScanGit } from "../../sources/git/runScanGit.js";
-import { cleanupRoots, commitFile, createRepository, git, setOriginMain } from "./helpers.js";
+import {
+    readGitWorktreeFingerprint,
+    scanGitRepository,
+    scanGitRepositoryWithFingerprint,
+} from "../../sources/git/scanGitRepository.js";
+import { runScanGit, scanGitRunnerFromCommandRunner } from "../../sources/git/runScanGit.js";
+import {
+    cleanupRoots,
+    commitFile,
+    createRepository,
+    git,
+    gitRunner,
+    setOriginMain,
+} from "./helpers.js";
 
 afterEach(cleanupRoots);
 const execFile = promisify(execFileCallback);
@@ -100,6 +111,71 @@ describe("scanGitRepository", () => {
             );
         },
     );
+});
+
+describe("scanGitRepository fingerprints and reuse", () => {
+    // Git runs directly here so these run inside an already sandboxed test process too.
+    const runGit = scanGitRunnerFromCommandRunner({
+        run: async (cwd, args, options) =>
+            await gitRunner.run(cwd, ["--no-optional-locks", ...args], options),
+    });
+
+    it("proves an unchanged tree and notices content and staging changes", async () => {
+        const repository = await createRepository();
+        const base = await commitFile(repository, "a.txt", "one\n");
+        await setOriginMain(repository, base);
+        await writeFile(join(repository, "a.txt"), "one\ntwo\n");
+        await writeFile(join(repository, "untracked.txt"), "u\n");
+        const gitDirectory = join(repository, ".git");
+        const read = async () =>
+            await readGitWorktreeFingerprint({ gitDirectory, path: repository, runGit });
+
+        const scanned = await scanGitRepositoryWithFingerprint({
+            gitDirectory,
+            path: repository,
+            runGit,
+        });
+        expect(scanned.fingerprint).toBeDefined();
+        expect(await read()).toBe(scanned.fingerprint);
+
+        // Still " M" to status: only the file's own stat can tell this apart.
+        await writeFile(join(repository, "a.txt"), "one\nthree\n");
+        await utimes(
+            join(repository, "a.txt"),
+            new Date(2_000_000_000_000),
+            new Date(2_000_000_000_000),
+        );
+        const edited = await read();
+        expect(edited).not.toBe(scanned.fingerprint);
+
+        await git(repository, ["add", "a.txt"]);
+        expect(await read()).not.toBe(edited);
+    });
+
+    it("carries untracked line counts forward only for unchanged files", async () => {
+        const repository = await createRepository();
+        const base = await commitFile(repository, "a.txt", "one\n");
+        await setOriginMain(repository, base);
+        const path = join(repository, "untracked.txt");
+        await writeFile(path, "a\nb\n");
+        const first = await scanGitRepository({ path: repository, runGit });
+        expect(first.files.find((file) => file.path === "untracked.txt")?.insertions).toBe(2);
+
+        // A marked count proves the second scan reused it instead of reading the file.
+        const previous = {
+            ...first,
+            files: first.files.map((file) =>
+                file.path === "untracked.txt" ? { ...file, insertions: 99 } : file,
+            ),
+        };
+        const reused = await scanGitRepository({ path: repository, previous, runGit });
+        expect(reused.files.find((file) => file.path === "untracked.txt")?.insertions).toBe(99);
+
+        await writeFile(path, "a\n");
+        await utimes(path, new Date(2_000_000_000_000), new Date(2_000_000_000_000));
+        const recounted = await scanGitRepository({ path: repository, previous, runGit });
+        expect(recounted.files.find((file) => file.path === "untracked.txt")?.insertions).toBe(1);
+    });
 });
 
 async function readFifo(path: string): Promise<void> {

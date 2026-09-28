@@ -43,7 +43,7 @@ collection still works — it takes a lifetime of its own.
 - **Snapshots.** `generation`, `snapshot`, `watch`, `invalidate`.
 - **Live tracking.** `track`, `untrack`, `replaceTracked`, `markChanged`, `trackedSnapshot`,
   `trackedKeys`, `liveSnapshots`, `refresh`, and `onSnapshot(observer)` which returns its own
-  unsubscribe.
+  unsubscribe. `watchWorkingTree(root, observer)` shares the live working-tree watch.
 - **Shutdown.** `dispose` stops every watcher, clears the cache and closes the credential broker.
 
 ## Behavior worth knowing
@@ -55,11 +55,21 @@ carries both old and new bytes for binary deltas that remain displayable.
 
 Watching is a subscription, not a scan. Worktrees share physical watchers for their common Git
 directory and refs, while ref events fan out only to worktrees whose branch, upstream, or
-`origin/main` comparison can change. Recursive working-tree events are debounced and first checked
-with a path-scoped status, so ignored build output does not schedule the full snapshot scan. Full
-rescans run two at a time on the module's own lifetime. A single stale deadline is the fallback for
-missed events; renewing an unchanged subscription only extends its lifetime and does not make it
-dirty. Platforms without recursive working-tree watches use a shorter stale deadline.
+`origin/main` comparison can change. Working trees are watched with `@parcel/watcher`: Watchman
+when it is installed, otherwise FSEvents, ReadDirectoryChangesW, or inotify. Directories Git
+ignores are excluded from the watch itself, which on Linux is what keeps `node_modules` from
+spending thousands of inotify watches, and the ignore list is re-derived when `.gitignore` changes
+or new directories appear. `watchWorkingTree` shares that one watch per folder with other modules.
+
+Working-tree events are debounced and first checked with a path-scoped status, so ignored build
+output does not schedule the full snapshot scan. Full rescans run two at a time on the module's own
+lifetime. A stale deadline is the fallback for missed events: two minutes while the working tree is
+watched, thirty seconds while it cannot be (an exhausted inotify budget, a filesystem without
+events), doubling after each check that finds nothing moved, up to ten times that. A stale check
+first compares a cheap fingerprint — one status plus a stat of each changed path — and runs the
+diff only when it moved; a full scan still runs at least every thirty minutes. Untracked line
+counts and binary bytes of files unchanged since the last scan are carried forward. Renewing an
+unchanged subscription only extends its lifetime and does not make it dirty.
 
 A repository that has not been scanned yet simply has no snapshot to report. Subscribers hear only
 about repositories that actually changed, and a subscriber that throws is treated as a failed

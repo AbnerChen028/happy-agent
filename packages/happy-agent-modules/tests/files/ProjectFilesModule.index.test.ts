@@ -2,19 +2,24 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { FileFinder } from "@ff-labs/fff-node";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { GitModule } from "../../sources/git/index.js";
+import { GitModule } from "../../sources/git/index.js";
 import { ProjectFilesModule, type ProjectFileRoot } from "../../sources/files/index.js";
 import type { ProjectsModule } from "../../sources/projects/index.js";
 import type { WorkspacesModule } from "../../sources/workspaces/index.js";
+import { gitRunner } from "../git/helpers.js";
 
 const directories = new Set<string>();
 const modules = new Set<ProjectFilesModule>();
+const gits = new Set<GitModule>();
 
 afterEach(async () => {
     await Promise.all([...modules].map(async (module) => await module.close()));
     modules.clear();
+    for (const git of gits) git.dispose();
+    gits.clear();
     await Promise.all(
         [...directories].map(
             async (directory) =>
@@ -121,33 +126,51 @@ describe("ProjectFilesModule index", () => {
         });
     });
 
-    it("refreshes an aged index when an unseen external file is created", async () => {
+    it("rescans when the watched tree reports an unseen external file", async () => {
         const root = await workspace();
         await writeFile(join(root, "README.md"), "workspace");
         const files = createFiles();
         const resolvedRoot = await fileRoot(root);
-        const now = Date.now();
-        const clock = vi.spyOn(Date, "now").mockReturnValue(now);
         await files.search(resolvedRoot, { query: "readme" });
 
         await writeFile(join(root, "outside.txt"), "external");
-        clock.mockReturnValue(now + 3_000);
 
-        const result = await files.search(resolvedRoot, { query: "outside" });
-        expect(result.files.map((file) => file.path)).toContain("outside.txt");
-        clock.mockRestore();
+        await vi.waitFor(
+            async () => {
+                const result = await files.search(resolvedRoot, { query: "outside" });
+                expect(result.files.map((file) => file.path)).toContain("outside.txt");
+            },
+            { timeout: 15_000 },
+        );
+    });
+
+    it("does not rescan an idle watched workspace however old its index is", async () => {
+        const root = await workspace();
+        await writeFile(join(root, "README.md"), "workspace");
+        const files = createFiles();
+        const resolvedRoot = await fileRoot(root);
+        await files.search(resolvedRoot, { query: "readme" });
+        // Let the watch arm; the first search's scan is the only one this index needs.
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        const scans = vi.spyOn(FileFinder.prototype, "scanFiles");
+        const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60 * 60 * 1000);
+        try {
+            for (let search = 0; search < 5; search += 1) {
+                await files.search(resolvedRoot, { query: "readme" });
+            }
+            expect(scans).not.toHaveBeenCalled();
+        } finally {
+            clock.mockRestore();
+            scans.mockRestore();
+        }
     });
 });
 
 function createFiles(): ProjectFilesModule {
-    const files = new ProjectFilesModule(
-        {} as ProjectsModule,
-        {} as WorkspacesModule,
-        {
-            invalidate: () => undefined,
-            markChanged: () => undefined,
-        } as unknown as GitModule,
-    );
+    // A real Git module, so the index follows the same shared working-tree watch as production.
+    const git = GitModule.withRunner(gitRunner);
+    gits.add(git);
+    const files = new ProjectFilesModule({} as ProjectsModule, {} as WorkspacesModule, git);
     modules.add(files);
     return files;
 }

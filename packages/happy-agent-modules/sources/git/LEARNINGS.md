@@ -21,3 +21,14 @@ missing. Historical reads now verify that the revision names a tree before class
 absence. Unknown or unavailable history remains an operational failure; only an absent path
 within an existing tree returns `found: false`. Oversized blobs have a typed error so bounded
 viewers can explain their limit without parsing Git's human-readable output.
+
+## Idle repositories must cost nothing
+
+Linux had no working-tree watch, so every tracked repository — every workspace the phone knew
+about, renewed each minute — got a full scan every thirty seconds: status over the whole tree, a
+rename-detecting diff against the merge base, and reads of untracked and binary files. On a server
+with many workspaces this showed up as periodic IO storms. Working trees are now watched on every
+platform through `@parcel/watcher`, with Git-ignored directories excluded from the watch so inotify
+spends hundreds of watches per checkout instead of tens of thousands. Polling remains only as the
+fallback for a tree that cannot be watched, backs off while nothing changes, and proves "nothing
+changed" with a status and a stat of each changed path before it will run a diff.

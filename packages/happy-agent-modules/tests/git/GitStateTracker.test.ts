@@ -1,4 +1,5 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createRootContext } from "@steve.kite/stdlib";
@@ -148,6 +149,42 @@ describe("GitStateTracker scheduling", () => {
         tracker.dispose();
     });
 
+    it("backs idle reconciliation off and checks only status while nothing changed", async () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(1_000);
+        const scan = testScan();
+        const tracker = new GitStateTracker(createRootContext(), scan.run, owner());
+        try {
+            await startTracking(tracker);
+            expect(scan.fullStatusReads).toBe(1);
+            expect(scan.diffReads).toBe(1);
+
+            // The first stale deadline only proves nothing moved: status, and no diff.
+            await advance(GIT_RECONCILE_STALE_AFTER_MS);
+            expect(scan.fullStatusReads).toBe(2);
+            expect(scan.diffReads).toBe(1);
+
+            // Each unchanged check doubles the wait before the next one.
+            await advance(GIT_RECONCILE_STALE_AFTER_MS);
+            expect(scan.fullStatusReads).toBe(2);
+            await advance(GIT_RECONCILE_STALE_AFTER_MS);
+            expect(scan.fullStatusReads).toBe(3);
+            expect(scan.diffReads).toBe(1);
+
+            // A moved working tree is rescanned in full and restores the short interval.
+            scan.statusEntries = ["? src/new.ts"];
+            await advance(4 * GIT_RECONCILE_STALE_AFTER_MS);
+            await settleIo(() => tracker.snapshot(entity)?.changedFiles === 1);
+            expect(scan.diffReads).toBe(2);
+            expect(scan.fullStatusReads).toBe(5);
+            await advance(GIT_RECONCILE_STALE_AFTER_MS);
+            expect(scan.fullStatusReads).toBe(6);
+            expect(scan.diffReads).toBe(2);
+        } finally {
+            tracker.dispose();
+        }
+    });
+
     it("runs at most two full repository scans concurrently", async () => {
         vi.useFakeTimers();
         vi.setSystemTime(1_000);
@@ -207,17 +244,21 @@ describe("gitReferenceChangeAffectsSnapshot", () => {
 });
 
 interface TestScan {
+    diffReads: number;
     fullStatusReads: number;
     pathStatusDirty: boolean;
     pathStatusReads: number;
     run: ScanGitRunner;
+    statusEntries: string[];
 }
 
 function testScan(): TestScan {
     const scan: TestScan = {
+        diffReads: 0,
         fullStatusReads: 0,
         pathStatusDirty: false,
         pathStatusReads: 0,
+        statusEntries: [],
         run: async (options) => {
             const command = options.args[0];
             if (command === "status") {
@@ -229,6 +270,7 @@ function testScan(): TestScan {
                             "# branch.head main",
                             "# branch.upstream origin/main",
                             "# branch.ab +0 -0",
+                            ...scan.statusEntries,
                             "",
                         ].join("\0"),
                     );
@@ -244,7 +286,10 @@ function testScan(): TestScan {
                 return result(`${options.cwd}/.git\n`);
             }
             if (command === "merge-base") return result(`${HEAD}\n`);
-            if (command === "diff") return result("");
+            if (command === "diff") {
+                scan.diffReads += 1;
+                return result("");
+            }
             throw new Error(`Unexpected Git command: ${options.args.join(" ")}`);
         },
     };
@@ -270,6 +315,21 @@ async function startTracking(tracker: GitStateTracker): Promise<void> {
     await vi.advanceTimersByTimeAsync(150);
     await settlePromises();
     expect(tracker.snapshot(entity)).toBeDefined();
+}
+
+async function advance(milliseconds: number): Promise<void> {
+    await vi.advanceTimersByTimeAsync(milliseconds);
+    await settlePromises();
+}
+
+/** Lets real filesystem reads made by fingerprinting finish while the clock stays frozen. */
+async function settleIo(predicate: () => boolean): Promise<void> {
+    for (let index = 0; index < 200; index += 1) {
+        if (predicate()) return;
+        await vi.advanceTimersByTimeAsync(0);
+        await stat(tmpdir());
+    }
+    throw new Error("Timed out waiting for filesystem work to settle.");
 }
 
 async function settlePromises(): Promise<void> {

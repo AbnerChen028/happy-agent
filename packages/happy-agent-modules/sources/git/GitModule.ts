@@ -19,6 +19,7 @@ import { countUntrackedFileLines, type UntrackedFileCount } from "./countUntrack
 import { createGitWorktree } from "./createGitWorktree.js";
 import { detectGitDefaultBranch } from "./detectGitDefaultBranch.js";
 import { GitStateTracker } from "./impl/GitStateTracker.js";
+import { WorkingTreeWatcher, type WorkingTreeObserver } from "./impl/WorkingTreeWatcher.js";
 import { isGitWorktreeAt } from "./isGitWorktreeAt.js";
 import { listGitWorkingTreeFiles, type GitWorkingTreeFiles } from "./listGitWorkingTreeFiles.js";
 import { normalizeFuturePath } from "./normalizeFuturePath.js";
@@ -151,6 +152,7 @@ export class GitModule implements AgentModule {
     #read: GitCommandRunner;
     #scan: ScanGitRunner;
     #tracker: GitStateTracker | undefined;
+    #tree: WorkingTreeWatcher | undefined;
     #version = 0;
 
     constructor(config?: ConfigModule) {
@@ -715,6 +717,19 @@ export class GitModule implements AgentModule {
         this.#tracker?.unwatch(entity);
     }
 
+    /**
+     * Watches one folder's working tree until the returned function is called.
+     *
+     * Every observer of the same folder shares one native recursive watch that excludes what Git
+     * ignores, and it is the same watch the live Git tracking uses. `onWatching(false)` means
+     * events are not arriving and the caller must poll; `onChanges(null)` means some may have
+     * been missed.
+     */
+    watchWorkingTree(root: string, observer: WorkingTreeObserver): () => void {
+        if (this.#disposed) return () => undefined;
+        return this.#treeInstance().watch(root, observer);
+    }
+
     /** Tells the watcher a repository is dirty, for a change it saw before the watcher did. */
     markChanged(entity: GitTrackedEntity): void {
         this.#tracker?.markChanged(entity);
@@ -762,6 +777,8 @@ export class GitModule implements AgentModule {
         this.#disposed = true;
         this.#tracker?.dispose();
         this.#tracker = undefined;
+        this.#tree?.dispose();
+        this.#tree = undefined;
         this.#observers.clear();
         this.#cache.clear();
         this.#credentials.close();
@@ -769,24 +786,35 @@ export class GitModule implements AgentModule {
 
     // --- Internals -------------------------------------------------------------------------
 
+    #treeInstance(): WorkingTreeWatcher {
+        this.#tree ??= new WorkingTreeWatcher(this.#root(), this.#scan);
+        return this.#tree;
+    }
+
     #trackerInstance(): GitStateTracker {
-        this.#tracker ??= new GitStateTracker(this.#root(), this.#scan, {
-            deliver: async (ctx, entity, snapshot) => {
-                // Snapshotted so a subscriber that unsubscribes mid-delivery still sees this one.
-                const observers = Array.from(this.#observers);
-                for (const observer of observers) {
-                    await observer(ctx, entity, snapshot);
-                }
+        const tree = this.#treeInstance();
+        this.#tracker ??= new GitStateTracker(
+            this.#root(),
+            this.#scan,
+            {
+                deliver: async (ctx, entity, snapshot) => {
+                    // Snapshotted so a subscriber that unsubscribes mid-delivery still sees this one.
+                    const observers = Array.from(this.#observers);
+                    for (const observer of observers) {
+                        await observer(ctx, entity, snapshot);
+                    }
+                },
+                report: (ctx, error, entity) => {
+                    ctx.log.debug("A Git watcher could not scan a repository.", {
+                        path: entity.path,
+                        projectId: entity.projectId,
+                    });
+                    ctx.log.debug("The Git watcher failure was:", {}, error);
+                },
+                stamp: (state) => this.#stamp(state),
             },
-            report: (ctx, error, entity) => {
-                ctx.log.debug("A Git watcher could not scan a repository.", {
-                    path: entity.path,
-                    projectId: entity.projectId,
-                });
-                ctx.log.debug("The Git watcher failure was:", {}, error);
-            },
-            stamp: (state) => this.#stamp(state),
-        });
+            tree,
+        );
         return this.#tracker;
     }
 

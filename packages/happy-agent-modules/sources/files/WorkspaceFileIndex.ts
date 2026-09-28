@@ -2,6 +2,8 @@ import { resolve } from "node:path";
 
 import type { FileFinder } from "@ff-labs/fff-node";
 
+import type { GitModule } from "../git/index.js";
+
 const DEFAULT_MAX_INDEXES = 8;
 const RESCAN_AFTER_MS = 2_000;
 const SEARCH_READY_BUDGET_MS = 100;
@@ -9,24 +11,40 @@ const SEARCH_READY_BUDGET_MS = 100;
 interface FinderState {
     readonly finder: FileFinder;
     lastScanAt: number;
+    /** Whether a file was added, removed, or renamed since the last scan started. */
+    stale: boolean;
+    readonly unwatch: () => void;
+    /** Whether working-tree events are arriving; without them a search rescans on a timer. */
+    watching: boolean;
 }
 
+/**
+ * Bounded file-name indexes, one per recently searched workspace.
+ *
+ * The index is rescanned only when the Git module's shared working-tree watch reports a path
+ * appearing or disappearing, so an idle workspace costs nothing. fff's own watcher stays off:
+ * it would be a second recursive watch of the same tree. When a tree cannot be watched, a search
+ * falls back to rescanning when the index is more than a couple of seconds old.
+ */
 export class WorkspaceFileIndex {
     readonly #finders = new Map<string, FinderState>();
+    readonly #git: GitModule;
     readonly #maxIndexes = DEFAULT_MAX_INDEXES;
     #fileFinderConstructor: Promise<typeof import("@ff-labs/fff-node").FileFinder> | undefined;
 
+    constructor(git: GitModule) {
+        this.#git = git;
+    }
+
     close(): void {
-        for (const state of this.#finders.values()) {
-            state.finder.destroy();
-        }
+        for (const state of this.#finders.values()) this.#destroy(state);
         this.#finders.clear();
     }
 
+    /** Marks an index out of date after a structural change the caller made or observed. */
     refresh(root: string): void {
         const state = this.#finders.get(resolve(root));
-        if (state === undefined) return;
-        this.#startScan(state);
+        if (state !== undefined) state.stale = true;
     }
 
     /** Requests a scan only when a file proven by a direct read is absent from a warm index. */
@@ -46,7 +64,10 @@ export class WorkspaceFileIndex {
         limit: number,
     ): Promise<readonly { readonly fileName: string; readonly path: string }[]> {
         const state = await this.#stateFor(root);
-        if (Date.now() - state.lastScanAt > RESCAN_AFTER_MS) this.#startScan(state);
+        const outdated = state.watching
+            ? state.stale
+            : Date.now() - state.lastScanAt > RESCAN_AFTER_MS;
+        if (outdated) this.#startScan(state);
         if (state.finder.isScanning()) {
             await this.#waitForScan(state.finder, SEARCH_READY_BUDGET_MS);
         }
@@ -74,13 +95,37 @@ export class WorkspaceFileIndex {
             basePath,
             disableContentIndexing: true,
             disableMmapCache: true,
+            disableWatch: true,
         });
         if (!created.ok) {
             throw new Error(`Workspace files could not be indexed: ${created.error}`);
         }
 
-        const finder = created.value;
-        const state: FinderState = { finder, lastScanAt: Date.now() };
+        const holder: { state?: FinderState } = {};
+        const unwatch = this.#git.watchWorkingTree(basePath, {
+            onChanges: (changes) => {
+                const state = holder.state;
+                if (state === undefined) return;
+                if (changes === null || changes.some((change) => change.kind !== "update")) {
+                    state.stale = true;
+                }
+            },
+            onWatching: (watching) => {
+                const state = holder.state;
+                if (state === undefined) return;
+                state.watching = watching;
+                // Whatever happened while unwatched is unknown.
+                if (!watching) state.stale = true;
+            },
+        });
+        const state: FinderState = {
+            finder: created.value,
+            lastScanAt: Date.now(),
+            stale: false,
+            unwatch,
+            watching: false,
+        };
+        holder.state = state;
         this.#finders.set(basePath, state);
         this.#removeOldestIndex();
         return state;
@@ -92,7 +137,10 @@ export class WorkspaceFileIndex {
 
     #startScan(state: FinderState): void {
         if (state.finder.isScanning()) return;
+        // Cleared before scanning, so a change during the scan leaves the index stale again.
+        state.stale = false;
         if (state.finder.scanFiles().ok) state.lastScanAt = Date.now();
+        else state.stale = true;
     }
 
     #removeOldestIndex(): void {
@@ -103,7 +151,12 @@ export class WorkspaceFileIndex {
 
         const oldest = this.#finders.get(oldestPath);
         this.#finders.delete(oldestPath);
-        oldest?.finder.destroy();
+        if (oldest !== undefined) this.#destroy(oldest);
+    }
+
+    #destroy(state: FinderState): void {
+        state.unwatch();
+        state.finder.destroy();
     }
 
     async #loadFileFinder(): Promise<typeof import("@ff-labs/fff-node").FileFinder> {

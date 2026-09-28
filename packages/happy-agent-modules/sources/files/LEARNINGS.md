@@ -23,9 +23,17 @@ Git repository cannot silently hide the binary-filename limitation.
 
 Loading the FFF native binding while composing the daemon put optional file indexing on the
 workspace-startup critical path. The module imports FFF lazily on the first search request. Later
-requests reuse the loaded binding and a bounded set of watched workspace indexes. Because native
-watchers can miss external changes, an index older than two seconds starts a rescan before search,
-but the request waits at most 100 milliseconds and then uses the live partial index.
+requests reuse the loaded binding and a bounded set of workspace indexes. A search waits at most
+100 milliseconds for an active scan and then uses the live partial index.
+
+## The index rescans on events, not on age
+
+Running FFF's watcher and also rescanning any index older than two seconds walked whole trees on
+nearly every search, and every file create or rename triggered another full walk. FFF's watcher is
+now disabled; the index subscribes to the Git module's shared working-tree watch, which already
+excludes ignored directories, and is marked stale only when a path is created or deleted. An idle
+workspace is never rescanned. The two-second age rule survives only for a tree that cannot be
+watched.
 
 ## File trees must not wait for autocomplete indexing
 

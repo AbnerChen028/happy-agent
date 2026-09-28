@@ -1,8 +1,9 @@
-import { constants, statSync } from "node:fs";
-import { open, type FileHandle } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, open, type FileHandle } from "node:fs/promises";
 import { join } from "node:path";
 
-import { countUntrackedFileLines } from "./countUntrackedFileLines.js";
+import { countUntrackedFileLines, type UntrackedFileCount } from "./countUntrackedFileLines.js";
+import { gitIndexFingerprint, gitWorktreeFingerprint } from "./gitWorktreeFingerprint.js";
 import { parseGitRawNumstat, type GitDiffChange } from "./parseGitRawNumstat.js";
 import { parseGitStatusV2, type GitStatusEntry, type GitStatusV2 } from "./parseGitStatusV2.js";
 import { readGitFileAtRevision } from "./readGitFileAtRevision.js";
@@ -21,17 +22,66 @@ const DELETED_CONTENT_TOKEN = "deleted";
 const UNTRACKED_COUNT_LIMIT = 200;
 const UNTRACKED_BYTE_LIMIT = 1024 * 1024;
 const CONSISTENCY_ATTEMPTS = 3;
+const STATUS_ARGS = ["status", "--porcelain=v2", "-z", "--branch", "--untracked-files=all"];
 
 export interface ScanGitRepositoryOptions {
+    /** The repository's Git directory, when the caller already resolved it. */
+    gitDirectory?: string;
     now?: () => number;
     path: string;
+    /**
+     * The last state scanned from this repository. Untracked line counts and binary file bytes
+     * whose files have not changed since are carried forward instead of being read again.
+     */
+    previous?: GitChangeState;
     runGit?: ScanGitRunner;
     signal?: AbortSignal;
+}
+
+/** A scanned state and the worktree fingerprint it was scanned at, when one could be taken. */
+export interface FingerprintedGitChangeState {
+    fingerprint: string | undefined;
+    state: GitChangeState;
 }
 
 export async function scanGitRepository(
     options: ScanGitRepositoryOptions,
 ): Promise<GitChangeState> {
+    return (await scanGitRepositoryWithFingerprint(options)).state;
+}
+
+/**
+ * The cheap half of a scan: one status and a stat of each changed path.
+ *
+ * Equal to the fingerprint of the last full scan, it proves that scan is still current. It is
+ * `undefined` whenever that cannot be proved, which callers treat as a change.
+ */
+export async function readGitWorktreeFingerprint(
+    options: Pick<ScanGitRepositoryOptions, "gitDirectory" | "path" | "runGit" | "signal">,
+): Promise<string | undefined> {
+    const runGit = options.runGit ?? runScanGit;
+    try {
+        const indexFingerprint = gitIndexFingerprint(options.gitDirectory);
+        const result = await runGit({
+            args: STATUS_ARGS,
+            cwd: options.path,
+            ...(options.signal === undefined ? {} : { signal: options.signal }),
+        });
+        if (result.truncated) return undefined;
+        return await gitWorktreeFingerprint({
+            indexFingerprint,
+            root: options.path,
+            status: parseGitStatusV2(result.stdout),
+            statusOutput: result.stdout,
+        });
+    } catch {
+        return undefined;
+    }
+}
+
+export async function scanGitRepositoryWithFingerprint(
+    options: ScanGitRepositoryOptions,
+): Promise<FingerprintedGitChangeState> {
     const now = options.now ?? Date.now;
     const runGit = options.runGit ?? runScanGit;
     const run = async (args: readonly string[]): Promise<string> => {
@@ -42,16 +92,17 @@ export async function scanGitRepository(
         });
         return result.stdout;
     };
-    const gitDirectory = await resolveGitDirectory(run);
+    const gitDirectory = options.gitDirectory ?? (await resolveGitDirectory(run));
     let last: GitChangeState | undefined;
     for (let attempt = 0; attempt < CONSISTENCY_ATTEMPTS; attempt += 1) {
-        const before = indexFingerprint(gitDirectory);
-        const scanned = await scanOnce(options, runGit, run, now);
-        const after = indexFingerprint(gitDirectory);
-        last = scanned;
+        const before = gitIndexFingerprint(gitDirectory);
+        const scanned = await scanOnce(options, runGit, run, now, before);
+        const after = gitIndexFingerprint(gitDirectory);
+        last = scanned.state;
         if (before === after) return scanned;
     }
-    return last!;
+    // The index kept moving, so no fingerprint describes the state that was finally read.
+    return { fingerprint: undefined, state: last! };
 }
 
 async function scanOnce(
@@ -59,12 +110,18 @@ async function scanOnce(
     runGit: ScanGitRunner,
     run: (args: readonly string[]) => Promise<string>,
     now: () => number,
-): Promise<GitChangeState> {
+    indexFingerprint: string,
+): Promise<FingerprintedGitChangeState> {
+    const unfingerprinted = (state: GitChangeState): FingerprintedGitChangeState => ({
+        fingerprint: undefined,
+        state,
+    });
     let status: GitStatusV2;
     let statusTruncated = false;
+    let fingerprint: string | undefined;
     try {
         const result = await runGit({
-            args: ["status", "--porcelain=v2", "-z", "--branch", "--untracked-files=all"],
+            args: STATUS_ARGS,
             cwd: options.path,
             ...(options.signal === undefined ? {} : { signal: options.signal }),
         });
@@ -79,8 +136,18 @@ async function scanOnce(
                 ? result.stdout.slice(0, result.stdout.lastIndexOf("\0") + 1)
                 : result.stdout,
         );
+        // Taken before anything else is read, so a file that changes later in this scan makes the
+        // next fingerprint differ rather than hiding behind this one.
+        if (!result.truncated) {
+            fingerprint = await gitWorktreeFingerprint({
+                indexFingerprint,
+                root: options.path,
+                status,
+                statusOutput: result.stdout,
+            });
+        }
     } catch (error) {
-        return failed(emptyFacts(), errorMessage(error), now());
+        return unfingerprinted(failed(emptyFacts(), errorMessage(error), now()));
     }
 
     const facts = factsFromStatus(status);
@@ -90,7 +157,7 @@ async function scanOnce(
         run,
     });
     if (comparison.base === undefined) {
-        return {
+        return unfingerprinted({
             changedFiles: 0,
             comparison: "unavailable",
             conflicted,
@@ -102,7 +169,7 @@ async function scanOnce(
             filesTruncated: false,
             insertions: 0,
             scannedAt: now(),
-        };
+        });
     }
 
     let diff: readonly GitDiffChange[];
@@ -120,8 +187,12 @@ async function scanOnce(
         );
         if (result.truncated) countsExact = false;
     } catch (error) {
-        return failed(facts, errorMessage(error), now(), conflicted);
+        return unfingerprinted(failed(facts, errorMessage(error), now(), conflicted));
     }
+    const previous =
+        options.previous?.comparison === "ready"
+            ? new Map(options.previous.files.map((file) => [file.path, file]))
+            : new Map<string, GitFileChange>();
 
     const staging = new Map<string, GitStatusEntry>();
     for (const entry of status.entries) {
@@ -145,10 +216,10 @@ async function scanOnce(
             continue;
         }
         counted += 1;
-        const count = await countUntrackedFileLines(
-            join(options.path, entry.path),
-            UNTRACKED_BYTE_LIMIT,
-        );
+        const path = join(options.path, entry.path);
+        const count =
+            (await reusableUntrackedCount(path, previous.get(entry.path))) ??
+            (await countUntrackedFileLines(path, UNTRACKED_BYTE_LIMIT));
         if (count.inexact) countsExact = false;
         changes.push(untrackedChange(entry.path, count));
     }
@@ -183,11 +254,12 @@ async function scanOnce(
             change,
             runGit,
             options.signal,
+            options.previous?.base === comparison.base ? previous.get(change.path) : undefined,
         );
         if (enriched === undefined) hiddenLargeFiles = true;
         else displayed.push(enriched);
     }
-    return {
+    const state: GitChangeState = {
         base: comparison.base,
         changedFiles: changes.length,
         comparison: "ready",
@@ -200,6 +272,30 @@ async function scanOnce(
         insertions,
         scannedAt: now(),
     };
+    return { fingerprint, state };
+}
+
+/** A previous untracked count, when the file is provably the same one that was counted. */
+async function reusableUntrackedCount(
+    path: string,
+    previous: GitFileChange | undefined,
+): Promise<UntrackedFileCount | undefined> {
+    if (previous?.status !== "untracked" || previous.contentToken === undefined) return undefined;
+    if (!previous.binary && previous.insertions === undefined) return undefined;
+    try {
+        const details = await lstat(path);
+        if (!details.isFile()) return undefined;
+        if (previous.contentToken !== `${String(details.mtimeMs)}-${String(details.size)}`) {
+            return undefined;
+        }
+    } catch {
+        return undefined;
+    }
+    return {
+        binary: previous.binary,
+        inexact: false,
+        ...(previous.insertions === undefined ? {} : { insertions: previous.insertions }),
+    };
 }
 
 async function enrichDisplayedFile(
@@ -208,11 +304,35 @@ async function enrichDisplayedFile(
     change: GitFileChange,
     runGit: ScanGitRunner,
     signal: AbortSignal | undefined,
+    previous: GitFileChange | undefined,
 ): Promise<GitFileChange | undefined> {
     const currentPath = join(root, change.path);
     const current = await openWorkingFile(currentPath);
     if (current.kind === "too_large") return undefined;
     try {
+        const contentToken =
+            current.kind === "file"
+                ? `${String(current.mtimeMs)}-${String(current.size)}`
+                : change.status === "deleted" && current.kind === "missing"
+                  ? DELETED_CONTENT_TOKEN
+                  : undefined;
+        // The caller only offers a previous file scanned against this same base, so an unchanged
+        // token means both binary sides are the bytes already read.
+        if (
+            change.binary &&
+            contentToken !== undefined &&
+            previous?.binary === true &&
+            previous.contentToken === contentToken &&
+            previous.status === change.status &&
+            previous.previousPath === change.previousPath
+        ) {
+            return {
+                ...change,
+                contentToken,
+                ...(previous.newBytes === undefined ? {} : { newBytes: previous.newBytes }),
+                ...(previous.oldBytes === undefined ? {} : { oldBytes: previous.oldBytes }),
+            };
+        }
         let oldBytes: Uint8Array | undefined;
         if (change.status === "deleted" || change.binary) {
             try {
@@ -235,12 +355,6 @@ async function enrichDisplayedFile(
                 ? await readBounded(current.handle, DISPLAY_FILE_BYTE_LIMIT)
                 : undefined;
         if (newBytes === null) return undefined;
-        const contentToken =
-            current.kind === "file"
-                ? `${String(current.mtimeMs)}-${String(current.size)}`
-                : change.status === "deleted" && current.kind === "missing"
-                  ? DELETED_CONTENT_TOKEN
-                  : undefined;
         return {
             ...change,
             ...(contentToken === undefined ? {} : { contentToken }),
@@ -376,20 +490,6 @@ async function resolveGitDirectory(
     } catch {
         return undefined;
     }
-}
-
-function indexFingerprint(gitDirectory: string | undefined): string {
-    if (gitDirectory === undefined) return "";
-    return [join(gitDirectory, "index"), join(gitDirectory, "HEAD")]
-        .map((path) => {
-            try {
-                const stats = statSync(path);
-                return `${String(stats.size)}:${String(stats.mtimeMs)}`;
-            } catch {
-                return "missing";
-            }
-        })
-        .join("|");
 }
 
 function errorMessage(error: unknown): string {

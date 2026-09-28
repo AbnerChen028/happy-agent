@@ -180,7 +180,7 @@ export class ProjectFilesModule implements AgentModule {
     readonly #bots: BotsModule | undefined;
     readonly #listeners = new Set<ProjectFilesEventListener>();
     readonly #projects: ProjectsModule;
-    readonly #index = new WorkspaceFileIndex();
+    readonly #index: WorkspaceFileIndex;
     readonly #workspaces: WorkspacesModule;
     readonly #writeLocks = new Map<string, Promise<void>>();
     #closed = false;
@@ -195,6 +195,7 @@ export class ProjectFilesModule implements AgentModule {
     ) {
         this.#bots = bots;
         this.#git = git;
+        this.#index = new WorkspaceFileIndex(git);
         this.#projects = projects;
         this.#workspaces = workspaces;
     }

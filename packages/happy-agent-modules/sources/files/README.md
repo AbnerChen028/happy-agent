@@ -11,11 +11,12 @@ workspace root ──┬──> one-level physical tree pages
 ```
 
 Indexes are created lazily and kept in least-recently-used order. The module retains at most eight
-indexes; eviction and shutdown destroy the native finder so its watcher and memory are released.
+indexes; eviction and shutdown destroy the native finder and release its working-tree watch.
 File contents are not indexed. A search spends at most a small first-result budget waiting for an
-active scan, then queries FFF's live index instead of blocking on the entire workspace. Searches
-also start a rescan when the current index is more than two seconds old, covering external changes
-that a native watcher missed while preserving the same bounded response budget.
+active scan, then queries FFF's live index instead of blocking on the entire workspace. FFF's own
+watcher is off: the index follows the Git module's shared working-tree watch and rescans only
+after a path appears or disappears. When a tree cannot be watched, a search rescans an index more
+than two seconds old instead.
 
 Tree pages never start or await FFF. They read one physical directory directly, so ignored folders
 such as `node_modules` remain visible without being recursively indexed. Reading a file or tree

@@ -1,13 +1,17 @@
 import type { Context, RootContext } from "@steve.kite/stdlib";
 
 import type { ScanGitRunner } from "../runScanGit.js";
-import { scanGitRepository } from "../scanGitRepository.js";
+import {
+    readGitWorktreeFingerprint,
+    scanGitRepository,
+    scanGitRepositoryWithFingerprint,
+} from "../scanGitRepository.js";
 import type { GitChangeSnapshot, GitChangeState, GitTrackedEntity } from "../types.js";
 import {
     GitRepositoryWatchRegistry,
-    supportsRecursiveWorktreeWatch,
     type GitRepositoryChange,
 } from "../watchGitRepositoryChanges.js";
+import { WorkingTreeWatcher, type WorkingTreeChange } from "./WorkingTreeWatcher.js";
 
 const WATCH_TTL_MS = 5 * 60 * 1000;
 const TRACKED_LIMIT = 256;
@@ -21,10 +25,15 @@ const WORKTREE_PATH_BATCH = 64;
 const PATH_STATUS_OUTPUT_LIMIT = 64 * 1024;
 const BACKOFF_START_MS = 1_000;
 const BACKOFF_LIMIT_MS = 30_000;
+/** However long a repository has been idle, a full scan still runs this often. */
+const FULL_SCAN_LIMIT_MS = 30 * 60 * 1000;
+/** Each unchanged stale check doubles the wait, up to this many times the starting interval. */
+const IDLE_RECONCILE_FACTOR = 10;
 
-export const GIT_RECONCILE_STALE_AFTER_MS = supportsRecursiveWorktreeWatch()
-    ? RECURSIVE_WATCH_STALE_MS
-    : POLLING_STALE_MS;
+/** The stale deadline of a repository whose working tree is not delivering events. */
+export const GIT_RECONCILE_STALE_AFTER_MS = POLLING_STALE_MS;
+/** The stale deadline of a repository whose working tree is watched. */
+export const GIT_WATCHED_RECONCILE_STALE_AFTER_MS = RECURSIVE_WATCH_STALE_MS;
 
 /**
  * What a finished scan is handed back to.
@@ -49,18 +58,29 @@ interface RepositoryTracker {
     entity: GitTrackedEntity;
     expiresAt: number;
     firstDirtyAt: number | undefined;
+    /** The worktree fingerprint the current snapshot was scanned at. */
+    fingerprint: string | undefined;
+    fullScanAt: number;
     generation: number;
+    gitDirectory: string | undefined;
     inFlight: Promise<void> | undefined;
     key: string;
     lastActiveAt: number;
     readonly pendingWorktreePaths: Set<string>;
     reconcileAt: number | undefined;
+    /** The wait before the next stale check, doubled each time a check finds nothing moved. */
+    reconcileDelayMs: number;
+    /** Whether the queued scan is only a stale check, which a matching fingerprint satisfies. */
+    reconciling: boolean;
     scanController: AbortController | undefined;
     scanning: boolean;
     snapshot: GitChangeSnapshot | undefined;
     snapshotDelivered: boolean;
+    /** Whether the working-tree watcher is delivering events, so polling can relax. */
+    treeWatching: boolean;
     unclassifiedDirty: boolean;
     unwatch: (() => void) | undefined;
+    unwatchTree: (() => void) | undefined;
 }
 
 /**
@@ -77,15 +97,24 @@ export class GitStateTracker {
     readonly #pendingScans: string[] = [];
     readonly #scan: ScanGitRunner;
     readonly #trackers = new Map<string, RepositoryTracker>();
+    readonly #tree: WorkingTreeWatcher;
+    readonly #ownsTree: boolean;
     readonly #watchRegistry: GitRepositoryWatchRegistry;
     #activeScans = 0;
     #disposed = false;
     #maintenanceTimer: NodeJS.Timeout | undefined;
 
-    constructor(rootContext: RootContext, scan: ScanGitRunner, owner: GitStateTrackerOwner) {
+    constructor(
+        rootContext: RootContext,
+        scan: ScanGitRunner,
+        owner: GitStateTrackerOwner,
+        tree?: WorkingTreeWatcher,
+    ) {
         this.#ctx = rootContext.named("git-state-tracker");
         this.#owner = owner;
         this.#scan = scan;
+        this.#ownsTree = tree === undefined;
+        this.#tree = tree ?? new WorkingTreeWatcher(rootContext, scan);
         this.#watchRegistry = new GitRepositoryWatchRegistry(rootContext);
         this.#ctx.lifetime?.addEventListener("abort", () => this.dispose(), { once: true });
     }
@@ -171,18 +200,25 @@ export class GitStateTracker {
             entity,
             expiresAt: Date.now() + WATCH_TTL_MS,
             firstDirtyAt: undefined,
+            fingerprint: undefined,
+            fullScanAt: 0,
             generation: 0,
+            gitDirectory: undefined,
             inFlight: undefined,
             key,
             lastActiveAt: Date.now(),
             pendingWorktreePaths: new Set(),
             reconcileAt: undefined,
+            reconcileDelayMs: GIT_RECONCILE_STALE_AFTER_MS,
+            reconciling: false,
             scanController: undefined,
             scanning: false,
             snapshot: undefined,
             snapshotDelivered: false,
+            treeWatching: false,
             unclassifiedDirty: false,
             unwatch: undefined,
+            unwatchTree: undefined,
         };
         this.#trackers.set(key, tracker);
         this.#evictExpired();
@@ -194,6 +230,14 @@ export class GitStateTracker {
     unwatch(entity: GitTrackedEntity): void {
         const tracker = this.#trackers.get(entityKey(entity));
         if (tracker !== undefined) this.#retire(tracker);
+    }
+
+    /** Brings a pending stale check forward; one already due sooner is left alone. */
+    #reconcileBy(tracker: RepositoryTracker, at: number): void {
+        if (tracker.scanning || tracker.snapshot === undefined) return;
+        if (tracker.reconcileAt !== undefined && tracker.reconcileAt <= at) return;
+        tracker.reconcileAt = at;
+        this.#scheduleMaintenance();
     }
 
     markChanged(entity: GitTrackedEntity): void {
@@ -331,6 +375,8 @@ export class GitStateTracker {
             await tracker.inFlight?.catch(() => undefined);
             if (this.#disposed || this.#trackers.get(tracker.key) !== tracker) break;
             if (!tracker.scanning) {
+                // An explicit refresh always reads the repository, never only its fingerprint.
+                tracker.reconciling = false;
                 await this.#scanTracker(ctx, tracker);
                 break;
             }
@@ -346,10 +392,15 @@ export class GitStateTracker {
         this.#pendingScans.length = 0;
         for (const tracker of Array.from(this.#trackers.values())) this.#retire(tracker);
         this.#watchRegistry.dispose();
+        if (this.#ownsTree) this.#tree.dispose();
     }
 
     #arm(tracker: RepositoryTracker): void {
         const generation = tracker.generation;
+        tracker.unwatchTree = this.#tree.watch(tracker.entity.path, {
+            onChanges: (changes) => this.#treeChanged(tracker, changes),
+            onWatching: (watching) => this.#treeWatching(tracker, watching),
+        });
         void this.#resolveGitDirectories(tracker.entity.path)
             .then((directories) => {
                 if (this.#disposed || tracker.generation !== generation) {
@@ -359,6 +410,7 @@ export class GitStateTracker {
                     this.markChanged(tracker.entity);
                     return;
                 }
+                tracker.gitDirectory = directories.gitDirectory;
                 tracker.unwatch = this.#watchRegistry.watch({
                     commonDirectory: directories.commonDirectory,
                     gitDirectory: directories.gitDirectory,
@@ -373,11 +425,31 @@ export class GitStateTracker {
             });
     }
 
-    #watchChanged(tracker: RepositoryTracker, change: GitRepositoryChange): void {
-        if (change.kind === "worktree" && change.path !== undefined) {
-            this.markWorktreeChanged(tracker.entity, change.path);
+    #treeChanged(tracker: RepositoryTracker, changes: readonly WorkingTreeChange[] | null): void {
+        if (this.#disposed || this.#trackers.get(tracker.key) !== tracker) return;
+        if (changes === null) {
+            this.markChanged(tracker.entity);
             return;
         }
+        for (const change of changes) this.markWorktreeChanged(tracker.entity, change.path);
+    }
+
+    /** A watched tree relaxes to the long stale deadline; losing the watch returns to polling. */
+    #treeWatching(tracker: RepositoryTracker, watching: boolean): void {
+        if (this.#disposed || this.#trackers.get(tracker.key) !== tracker) return;
+        if (tracker.treeWatching === watching) return;
+        tracker.treeWatching = watching;
+        tracker.reconcileDelayMs = this.#staleAfter(tracker);
+        if (!watching) this.#reconcileBy(tracker, Date.now() + tracker.reconcileDelayMs);
+    }
+
+    #staleAfter(tracker: RepositoryTracker): number {
+        return tracker.treeWatching
+            ? GIT_WATCHED_RECONCILE_STALE_AFTER_MS
+            : GIT_RECONCILE_STALE_AFTER_MS;
+    }
+
+    #watchChanged(tracker: RepositoryTracker, change: GitRepositoryChange): void {
         if (
             change.kind === "refs" &&
             !gitReferenceChangeAffectsSnapshot(tracker.snapshot, change.entry)
@@ -413,6 +485,7 @@ export class GitStateTracker {
         if (tracker.debounceTimer !== undefined) clearTimeout(tracker.debounceTimer);
         tracker.scanController?.abort();
         tracker.unwatch?.();
+        tracker.unwatchTree?.();
         this.#trackers.delete(tracker.key);
         for (let index = this.#pendingScans.length - 1; index >= 0; index -= 1) {
             if (this.#pendingScans[index] === tracker.key) this.#pendingScans.splice(index, 1);
@@ -458,15 +531,18 @@ export class GitStateTracker {
         for (const tracker of Array.from(this.#trackers.values())) {
             if (tracker.reconcileAt === undefined || tracker.reconcileAt > now) continue;
             tracker.reconcileAt = undefined;
-            this.#enqueue(tracker.key);
+            this.#enqueue(tracker.key, true);
         }
         this.#scheduleMaintenance();
     }
 
-    #enqueue(key: string): void {
+    #enqueue(key: string, reconciling = false): void {
         if (this.#disposed) return;
         const tracker = this.#trackers.get(key);
         if (tracker === undefined) return;
+        // A stale check queued behind a real change becomes the full scan that change needs.
+        const queued = this.#pendingScans.includes(key);
+        tracker.reconciling = reconciling && (!queued || tracker.reconciling);
         tracker.reconcileAt = undefined;
         this.#scheduleMaintenance();
         if (tracker.backoffTimer !== undefined && Date.now() < tracker.backoffUntil) return;
@@ -509,13 +585,31 @@ export class GitStateTracker {
     async #runScanTracker(ctx: Context, tracker: RepositoryTracker): Promise<void> {
         const generation = tracker.generation;
         const controller = new AbortController();
+        const reconciling = tracker.reconciling;
+        tracker.reconciling = false;
         tracker.scanning = true;
         tracker.scanController = controller;
         tracker.reconcileAt = undefined;
         this.#scheduleMaintenance();
         try {
-            const state = await this.#runScan(tracker.entity, controller.signal);
+            if (reconciling && (await this.#stillCurrent(tracker, controller.signal))) {
+                if (this.#disposed || tracker.generation !== generation) return;
+                this.#settleReconcile(tracker, true);
+                return;
+            }
+            const scanned = await scanGitRepositoryWithFingerprint({
+                ...(tracker.gitDirectory === undefined
+                    ? {}
+                    : { gitDirectory: tracker.gitDirectory }),
+                path: tracker.entity.path,
+                ...(tracker.snapshot === undefined ? {} : { previous: tracker.snapshot }),
+                runGit: this.#scan,
+                signal: controller.signal,
+            });
             if (this.#disposed || tracker.generation !== generation) return;
+            const state = scanned.state;
+            tracker.fingerprint = scanned.fingerprint;
+            tracker.fullScanAt = Date.now();
             const unchanged = tracker.snapshot !== undefined && sameState(tracker.snapshot, state);
             if (!unchanged || !tracker.snapshotDelivered) {
                 const snapshot =
@@ -526,11 +620,7 @@ export class GitStateTracker {
                 await this.#owner.deliver(ctx, tracker.entity, snapshot);
                 tracker.snapshotDelivered = true;
             }
-            tracker.backoffMs = BACKOFF_START_MS;
-            tracker.backoffUntil = 0;
-            if (tracker.backoffTimer !== undefined) clearTimeout(tracker.backoffTimer);
-            tracker.backoffTimer = undefined;
-            tracker.reconcileAt = Date.now() + GIT_RECONCILE_STALE_AFTER_MS;
+            this.#settleReconcile(tracker, unchanged);
         } catch (error) {
             if (this.#disposed || tracker.generation !== generation) return;
             const delay = tracker.backoffMs;
@@ -558,6 +648,44 @@ export class GitStateTracker {
             }
             this.#scheduleMaintenance();
         }
+    }
+
+    /**
+     * Whether the delivered snapshot is provably still current, by fingerprint alone.
+     *
+     * Only a stale check may be answered this way: a Git metadata event or an explicit refresh
+     * always scans. A full scan still runs at least every `FULL_SCAN_LIMIT_MS`, so a missed
+     * `origin/main` move cannot hide behind an unchanged working tree for long.
+     */
+    async #stillCurrent(tracker: RepositoryTracker, signal: AbortSignal): Promise<boolean> {
+        if (
+            tracker.fingerprint === undefined ||
+            tracker.gitDirectory === undefined ||
+            !tracker.snapshotDelivered ||
+            Date.now() - tracker.fullScanAt >= FULL_SCAN_LIMIT_MS
+        ) {
+            return false;
+        }
+        const fingerprint = await readGitWorktreeFingerprint({
+            gitDirectory: tracker.gitDirectory,
+            path: tracker.entity.path,
+            runGit: this.#scan,
+            signal,
+        });
+        return fingerprint !== undefined && fingerprint === tracker.fingerprint;
+    }
+
+    /** Clears retry backoff and schedules the next stale check: sooner after change, later when idle. */
+    #settleReconcile(tracker: RepositoryTracker, unchanged: boolean): void {
+        tracker.backoffMs = BACKOFF_START_MS;
+        tracker.backoffUntil = 0;
+        if (tracker.backoffTimer !== undefined) clearTimeout(tracker.backoffTimer);
+        tracker.backoffTimer = undefined;
+        const staleAfter = this.#staleAfter(tracker);
+        tracker.reconcileDelayMs = unchanged
+            ? Math.min(staleAfter * IDLE_RECONCILE_FACTOR, tracker.reconcileDelayMs * 2)
+            : staleAfter;
+        tracker.reconcileAt = Date.now() + tracker.reconcileDelayMs;
     }
 
     async #runScan(entity: GitTrackedEntity, signal?: AbortSignal): Promise<GitChangeState> {
