@@ -15,6 +15,13 @@ const CREATED_PATH_PROBES = 32;
 const IGNORE_RECHECK_DELAY_MS = 2_000;
 const IGNORE_RECHECK_INTERVAL_MS = 10_000;
 const RETRY_START_MS = 60_000;
+/**
+ * Whether ignored directories are listed so the native watch can skip them. Only per-directory
+ * watches (inotify) pay for ignored trees; Windows watches recursively in the kernel, and there a
+ * Git process running in the folder — slow to start through the sandbox — also keeps a folder
+ * that is being deleted locked.
+ */
+const LISTS_IGNORED = process.platform !== "win32";
 const RETRY_LIMIT_MS = 30 * 60 * 1000;
 
 export type WorkingTreeChangeKind = "create" | "delete" | "update";
@@ -39,6 +46,8 @@ interface WatchedRoot {
     ignored: readonly string[];
     ignoreCheckedAt: number;
     ignoreTimer: NodeJS.Timeout | undefined;
+    /** Aborts the Git listing in flight, so closing never leaves a process in the folder. */
+    readonly listing: AbortController;
     retryDelayMs: number;
     retryTimer: NodeJS.Timeout | undefined;
     readonly root: string;
@@ -87,9 +96,8 @@ function closeNative(subscription: AsyncSubscription): Promise<void> {
  * The ignore list is re-derived when `.gitignore` changes or new directories appear, and events
  * from newly ignored directories are dropped from then on.
  *
- * Windows uses Node's own `fs.watch` instead. ReadDirectoryChangesW is recursive in the kernel, so
- * ignored directories cost nothing to watch, and closing it releases the directory handle at
- * once; Parcel's asynchronous close left a just-deleted workspace folder locked (`EBUSY`).
+ * Windows keeps Node's own `fs.watch`, as it used before Parcel was introduced: ReadDirectoryChangesW
+ * is recursive in the kernel, so ignored directories cost nothing to watch and are only filtered.
  *
  * A folder keeps one native subscription for its whole life. It is never replaced by a narrower
  * one: a second subscription on a folder that is already watched shares the backend's cached
@@ -127,6 +135,7 @@ export class WorkingTreeWatcher {
                 ignoreCheckedAt: 0,
                 ignoreTimer: undefined,
                 ignored: [],
+                listing: new AbortController(),
                 observers: new Set(),
                 retryDelayMs: RETRY_START_MS,
                 retryTimer: undefined,
@@ -158,7 +167,7 @@ export class WorkingTreeWatcher {
 
     async #subscribe(entry: WatchedRoot): Promise<void> {
         const generation = ++entry.subscriptionGeneration;
-        const ignored = await this.#ignoredDirectories(entry.root);
+        const ignored = await this.#ignoredDirectories(entry);
         if (entry.closed || generation !== entry.subscriptionGeneration) return;
         entry.ignored = ignored;
         entry.ignoreCheckedAt = Date.now();
@@ -275,7 +284,7 @@ export class WorkingTreeWatcher {
     }
 
     #scheduleIgnoreCheck(entry: WatchedRoot): void {
-        if (entry.closed || entry.ignoreTimer !== undefined) return;
+        if (entry.closed || entry.ignoreTimer !== undefined || !LISTS_IGNORED) return;
         const delay = Math.max(
             IGNORE_RECHECK_DELAY_MS,
             entry.ignoreCheckedAt + IGNORE_RECHECK_INTERVAL_MS - Date.now(),
@@ -289,7 +298,7 @@ export class WorkingTreeWatcher {
 
     async #recheckIgnores(entry: WatchedRoot): Promise<void> {
         if (entry.closed || !entry.watching) return;
-        const ignored = await this.#ignoredDirectories(entry.root);
+        const ignored = await this.#ignoredDirectories(entry);
         if (entry.closed) return;
         entry.ignoreCheckedAt = Date.now();
         entry.ignored = ignored;
@@ -330,6 +339,7 @@ export class WorkingTreeWatcher {
         if (entry.closed) return;
         entry.closed = true;
         entry.subscriptionGeneration += 1;
+        entry.listing.abort();
         if (entry.ignoreTimer !== undefined) clearTimeout(entry.ignoreTimer);
         if (entry.retryTimer !== undefined) clearTimeout(entry.retryTimer);
         if (entry.subscription !== undefined) {
@@ -348,7 +358,8 @@ export class WorkingTreeWatcher {
      * `--directory` reports an ignored directory once instead of descending into it. A folder
      * that is not a repository ignores nothing beyond the fixed list.
      */
-    async #ignoredDirectories(root: string): Promise<readonly string[]> {
+    async #ignoredDirectories(entry: WatchedRoot): Promise<readonly string[]> {
+        if (!LISTS_IGNORED || entry.closed) return [];
         try {
             const result = await this.#scan({
                 args: [
@@ -359,8 +370,9 @@ export class WorkingTreeWatcher {
                     "--exclude-standard",
                     "--directory",
                 ],
-                cwd: root,
+                cwd: entry.root,
                 maximumBytes: IGNORED_LISTING_BYTES,
+                signal: entry.listing.signal,
             });
             const directories = result.stdout
                 .split("\0")

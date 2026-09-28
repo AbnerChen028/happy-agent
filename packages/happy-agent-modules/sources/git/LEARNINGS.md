@@ -40,6 +40,10 @@ subscription with a narrower one after `.gitignore` changed left the new subscri
 but deaf, because both share the backend's cached directory tree; a folder now keeps one
 subscription for life and events from newly ignored directories are filtered instead. Native
 subscribe and unsubscribe calls are serialized process-wide, because a watch opened while the
-backend was tearing down after its last close attached to the dying backend. On Windows, Parcel's
-asynchronous close left a just-deleted workspace folder locked (`EBUSY`), so Windows keeps Node's
-kernel-recursive `fs.watch`, whose close releases the directory immediately.
+backend was tearing down after its last close attached to the dying backend.
+
+On Windows, a stopped daemon left its workspace folder undeletable (`EBUSY`). The watcher had
+started a sandboxed `git ls-files` in the folder to learn what to ignore, and a process whose
+working directory is a folder keeps it locked on Windows even after its parent exits. Windows
+watches recursively in the kernel, so it no longer lists ignored directories at all and keeps
+Node's `fs.watch`; everywhere, closing a watch aborts a listing still in flight.
