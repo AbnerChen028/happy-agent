@@ -1,3 +1,4 @@
+import { watch as watchDirectory } from "node:fs";
 import { lstat } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -86,6 +87,10 @@ function closeNative(subscription: AsyncSubscription): Promise<void> {
  * The ignore list is re-derived when `.gitignore` changes or new directories appear, and events
  * from newly ignored directories are dropped from then on.
  *
+ * Windows uses Node's own `fs.watch` instead. ReadDirectoryChangesW is recursive in the kernel, so
+ * ignored directories cost nothing to watch, and closing it releases the directory handle at
+ * once; Parcel's asynchronous close left a just-deleted workspace folder locked (`EBUSY`).
+ *
  * A folder keeps one native subscription for its whole life. It is never replaced by a narrower
  * one: a second subscription on a folder that is already watched shares the backend's cached
  * directory tree and was observed to receive no events at all, so build output created after the
@@ -160,27 +165,31 @@ export class WorkingTreeWatcher {
         const handle = { live: true };
         let native: AsyncSubscription;
         try {
-            const parcel = await this.#loadParcel();
-            native = await serialized(
-                async () =>
-                    await parcel.subscribe(
-                        entry.root,
-                        (error, events) => {
-                            if (entry.closed || !handle.live) return;
-                            if (error !== null) {
-                                this.#failed(entry, error, true);
-                                return;
-                            }
-                            this.#deliver(entry, events);
-                        },
-                        {
-                            ignore: [
-                                ...ALWAYS_IGNORED,
-                                ...ignored.map((path) => join(entry.root, path)),
-                            ],
-                        },
-                    ),
-            );
+            if (process.platform === "win32") {
+                native = this.#watchWindows(entry, handle);
+            } else {
+                const parcel = await this.#loadParcel();
+                native = await serialized(
+                    async () =>
+                        await parcel.subscribe(
+                            entry.root,
+                            (error, events) => {
+                                if (entry.closed || !handle.live) return;
+                                if (error !== null) {
+                                    this.#failed(entry, error, true);
+                                    return;
+                                }
+                                this.#deliver(entry, events);
+                            },
+                            {
+                                ignore: [
+                                    ...ALWAYS_IGNORED,
+                                    ...ignored.map((path) => join(entry.root, path)),
+                                ],
+                            },
+                        ),
+                );
+            }
         } catch (error) {
             if (entry.closed || generation !== entry.subscriptionGeneration) return;
             this.#failed(entry, error, false);
@@ -199,13 +208,45 @@ export class WorkingTreeWatcher {
         }
     }
 
+    /** A kernel-recursive watch whose close releases the directory immediately. */
+    #watchWindows(entry: WatchedRoot, handle: { live: boolean }): AsyncSubscription {
+        const watcher = watchDirectory(entry.root, { recursive: true }, (event, filename) => {
+            if (entry.closed || !handle.live) return;
+            if (typeof filename !== "string") {
+                for (const observer of Array.from(entry.observers)) observer.onChanges(null);
+                return;
+            }
+            // `rename` covers both appearance and disappearance; either is structural.
+            this.#deliver(entry, [
+                {
+                    path: join(entry.root, filename),
+                    type: event === "rename" ? "create" : "update",
+                },
+            ]);
+        });
+        watcher.on("error", (error) => {
+            if (!entry.closed && handle.live) this.#failed(entry, error, true);
+        });
+        watcher.unref();
+        return {
+            unsubscribe: async () => {
+                watcher.close();
+            },
+        };
+    }
+
     #deliver(entry: WatchedRoot, events: readonly Event[]): void {
         const changes: WorkingTreeChange[] = [];
         const created: string[] = [];
         let ignoreRulesChanged = false;
         for (const event of events) {
             const path = relativePath(entry.root, event.path);
-            if (path === undefined || isUnder(path, ".git") || isIgnored(entry.ignored, path)) {
+            if (
+                path === undefined ||
+                isUnder(path, ".git") ||
+                path.split("/").includes("node_modules") ||
+                isIgnored(entry.ignored, path)
+            ) {
                 continue;
             }
             changes.push({ kind: event.type, path });
@@ -293,7 +334,9 @@ export class WorkingTreeWatcher {
         if (entry.retryTimer !== undefined) clearTimeout(entry.retryTimer);
         if (entry.subscription !== undefined) {
             entry.subscription.live = false;
-            void closeNative(entry.subscription.native);
+            // Windows handles must be released before the caller goes on to delete the folder.
+            if (process.platform === "win32") void entry.subscription.native.unsubscribe();
+            else void closeNative(entry.subscription.native);
         }
         entry.subscription = undefined;
         entry.observers.clear();

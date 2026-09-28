@@ -32,3 +32,14 @@ platform through `@parcel/watcher`, with Git-ignored directories excluded from t
 spends hundreds of watches per checkout instead of tens of thousands. Polling remains only as the
 fallback for a tree that cannot be watched, backs off while nothing changes, and proves "nothing
 changed" with a status and a stat of each changed path before it will run a diff.
+
+## A working-tree watch must never be replaced or outlive its folder
+
+Two watcher failures surfaced only in the release gate. On Linux, replacing a folder's Parcel
+subscription with a narrower one after `.gitignore` changed left the new subscription registered
+but deaf, because both share the backend's cached directory tree; a folder now keeps one
+subscription for life and events from newly ignored directories are filtered instead. Native
+subscribe and unsubscribe calls are serialized process-wide, because a watch opened while the
+backend was tearing down after its last close attached to the dying backend. On Windows, Parcel's
+asynchronous close left a just-deleted workspace folder locked (`EBUSY`), so Windows keeps Node's
+kernel-recursive `fs.watch`, whose close releases the directory immediately.
