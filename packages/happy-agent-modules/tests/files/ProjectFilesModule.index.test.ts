@@ -142,7 +142,7 @@ describe("ProjectFilesModule index", () => {
             },
             { timeout: 15_000 },
         );
-    });
+    }, 30_000);
 
     it("does not rescan an idle watched workspace however old its index is", async () => {
         const root = await workspace();

@@ -47,7 +47,7 @@ describe("WorkingTreeWatcher", { timeout: 60_000 }, () => {
         expect(watcher.isWatching(repository)).toBe(true);
     });
 
-    it("stops watching a directory once Git starts ignoring it", async () => {
+    it("stops reporting a directory once Git starts ignoring it", async () => {
         const repository = await createRepository();
         await commitFile(repository, ".gitignore", "build/\n");
         const { changes, watching } = watchRepository(repository);
@@ -90,6 +90,30 @@ describe("WorkingTreeWatcher", { timeout: 60_000 }, () => {
 
         second.release();
         expect(first.watcher.isWatching(repository)).toBe(false);
+    });
+
+    it("delivers events to a watch opened right after another one closed", async () => {
+        // The native backend is torn down when its last watch closes; a watch opened during that
+        // teardown used to attach to the dying backend and never hear anything.
+        for (let attempt = 0; attempt < 10; attempt += 1) {
+            const closing = await createRoot();
+            const first = new WorkingTreeWatcher(createRootContext(), scan);
+            let firstWatching = false;
+            first.watch(closing, {
+                onChanges: () => undefined,
+                onWatching: (watching) => {
+                    firstWatching = watching;
+                },
+            });
+            await waitFor(() => firstWatching);
+            first.dispose();
+
+            const opened = await createRoot();
+            const { changes, watching } = watchRepository(opened);
+            await waitFor(() => watching());
+            await writeFile(join(opened, "created.txt"), String(attempt));
+            await waitFor(() => changes.some((change) => change.path === "created.txt"));
+        }
     });
 
     it("reports an unwatchable folder so its observers keep polling", async () => {

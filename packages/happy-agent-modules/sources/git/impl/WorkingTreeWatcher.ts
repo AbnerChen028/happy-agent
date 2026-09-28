@@ -34,6 +34,7 @@ export interface WorkingTreeObserver {
 interface WatchedRoot {
     readonly observers: Set<WorkingTreeObserver>;
     closed: boolean;
+    /** Every directory Git currently ignores, whose events are dropped whether watched or not. */
     ignored: readonly string[];
     ignoreCheckedAt: number;
     ignoreTimer: NodeJS.Timeout | undefined;
@@ -48,11 +49,31 @@ interface WatchedRoot {
 
 interface LiveSubscription {
     readonly native: AsyncSubscription;
-    /** Cleared when this subscription is replaced or fails, which silences its callback. */
+    /** Cleared when this subscription fails or closes, which silences its callback. */
     live: boolean;
 }
 
 type ParcelWatcher = typeof import("@parcel/watcher");
+
+/**
+ * Every native subscribe and unsubscribe in the process, in order.
+ *
+ * `@parcel/watcher` shares one backend per process and tears it down when its last subscription
+ * closes. A subscription opened while that teardown is still running attaches to the dying backend
+ * and never receives an event, so a close must finish before the next open starts — across every
+ * watcher instance, since the backend is process-wide.
+ */
+let nativeOperations: Promise<unknown> = Promise.resolve();
+
+function serialized<Value>(operation: () => Promise<Value>): Promise<Value> {
+    const result = nativeOperations.then(operation, operation);
+    nativeOperations = result.catch(() => undefined);
+    return result;
+}
+
+function closeNative(subscription: AsyncSubscription): Promise<void> {
+    return serialized(async () => await subscription.unsubscribe()).catch(() => undefined);
+}
 
 /**
  * One native recursive watch per working tree, shared by every observer of that folder.
@@ -62,8 +83,13 @@ type ParcelWatcher = typeof import("@parcel/watcher");
  * each directory costs one kernel watch from a per-user budget. Git-ignored directories are
  * therefore excluded from the watch itself rather than filtered afterwards, which keeps a
  * checkout at hundreds of watches instead of the tens of thousands `node_modules` alone can hold.
- * The ignore list is re-derived when `.gitignore` changes or new directories appear, so build
- * output created later drops out as soon as Git calls it ignored.
+ * The ignore list is re-derived when `.gitignore` changes or new directories appear, and events
+ * from newly ignored directories are dropped from then on.
+ *
+ * A folder keeps one native subscription for its whole life. It is never replaced by a narrower
+ * one: a second subscription on a folder that is already watched shares the backend's cached
+ * directory tree and was observed to receive no events at all, so build output created after the
+ * watch started keeps its kernel watches until the folder is next watched afresh.
  *
  * A root that cannot be watched — an exhausted inotify budget, a filesystem without events, a
  * folder that does not exist yet — reports `watching: false`, and its observers keep polling.
@@ -131,44 +157,42 @@ export class WorkingTreeWatcher {
         if (entry.closed || generation !== entry.subscriptionGeneration) return;
         entry.ignored = ignored;
         entry.ignoreCheckedAt = Date.now();
-        // Events flow as soon as the native watch exists, even while an older one is still open.
         const handle = { live: true };
         let native: AsyncSubscription;
         try {
             const parcel = await this.#loadParcel();
-            native = await parcel.subscribe(
-                entry.root,
-                (error, events) => {
-                    if (entry.closed || !handle.live) return;
-                    if (error !== null) {
-                        this.#failed(entry, error, true);
-                        return;
-                    }
-                    this.#deliver(entry, events);
-                },
-                { ignore: [...ALWAYS_IGNORED, ...ignored.map((path) => join(entry.root, path))] },
+            native = await serialized(
+                async () =>
+                    await parcel.subscribe(
+                        entry.root,
+                        (error, events) => {
+                            if (entry.closed || !handle.live) return;
+                            if (error !== null) {
+                                this.#failed(entry, error, true);
+                                return;
+                            }
+                            this.#deliver(entry, events);
+                        },
+                        {
+                            ignore: [
+                                ...ALWAYS_IGNORED,
+                                ...ignored.map((path) => join(entry.root, path)),
+                            ],
+                        },
+                    ),
             );
         } catch (error) {
             if (entry.closed || generation !== entry.subscriptionGeneration) return;
-            // A narrower replacement that could not start leaves the working watch in place.
-            if (entry.subscription !== undefined) return;
             this.#failed(entry, error, false);
             return;
         }
         if (entry.closed || generation !== entry.subscriptionGeneration) {
             handle.live = false;
-            await native.unsubscribe().catch(() => undefined);
+            await closeNative(native);
             return;
         }
-        // The replacement is live before the previous watch closes, so a re-derived ignore list
-        // never opens a window in which changes go unseen.
-        const previous = entry.subscription;
         entry.subscription = Object.assign(handle, { native });
         entry.retryDelayMs = RETRY_START_MS;
-        if (previous !== undefined) {
-            previous.live = false;
-            await previous.native.unsubscribe().catch(() => undefined);
-        }
         if (!entry.watching) {
             entry.watching = true;
             for (const observer of Array.from(entry.observers)) observer.onWatching?.(true);
@@ -181,7 +205,9 @@ export class WorkingTreeWatcher {
         let ignoreRulesChanged = false;
         for (const event of events) {
             const path = relativePath(entry.root, event.path);
-            if (path === undefined || path === ".git" || path.startsWith(".git/")) continue;
+            if (path === undefined || isUnder(path, ".git") || isIgnored(entry.ignored, path)) {
+                continue;
+            }
             changes.push({ kind: event.type, path });
             if (basename(path) === ".gitignore") ignoreRulesChanged = true;
             else if (event.type === "create") created.push(event.path);
@@ -192,7 +218,7 @@ export class WorkingTreeWatcher {
         else if (created.length > 0) void this.#checkCreated(entry, created);
     }
 
-    /** A new directory may be build output Git ignores, which must not stay watched. */
+    /** A new directory may be build output Git ignores, whose events must stop being reported. */
     async #checkCreated(entry: WatchedRoot, paths: readonly string[]): Promise<void> {
         if (entry.ignoreTimer !== undefined) return;
         for (const path of paths.slice(0, CREATED_PATH_PROBES)) {
@@ -223,9 +249,9 @@ export class WorkingTreeWatcher {
     async #recheckIgnores(entry: WatchedRoot): Promise<void> {
         if (entry.closed || !entry.watching) return;
         const ignored = await this.#ignoredDirectories(entry.root);
+        if (entry.closed) return;
         entry.ignoreCheckedAt = Date.now();
-        if (entry.closed || sameList(ignored, entry.ignored)) return;
-        await this.#subscribe(entry);
+        entry.ignored = ignored;
     }
 
     #failed(entry: WatchedRoot, error: unknown, wasWatching: boolean): void {
@@ -239,7 +265,7 @@ export class WorkingTreeWatcher {
         entry.subscriptionGeneration += 1;
         if (subscription !== undefined) {
             subscription.live = false;
-            void subscription.native.unsubscribe().catch(() => undefined);
+            void closeNative(subscription.native);
         }
         if (entry.watching) {
             entry.watching = false;
@@ -267,7 +293,7 @@ export class WorkingTreeWatcher {
         if (entry.retryTimer !== undefined) clearTimeout(entry.retryTimer);
         if (entry.subscription !== undefined) {
             entry.subscription.live = false;
-            void entry.subscription.native.unsubscribe().catch(() => undefined);
+            void closeNative(entry.subscription.native);
         }
         entry.subscription = undefined;
         entry.observers.clear();
@@ -318,6 +344,11 @@ function relativePath(root: string, path: string): string | undefined {
     return sep === "/" ? value : value.split(sep).join("/");
 }
 
-function sameList(left: readonly string[], right: readonly string[]): boolean {
-    return left.length === right.length && left.every((value, index) => value === right[index]);
+function isUnder(path: string, directory: string): boolean {
+    return path === directory || path.startsWith(`${directory}/`);
+}
+
+/** Whether `path` is inside one of the ignored directories. */
+function isIgnored(ignored: readonly string[], path: string): boolean {
+    return ignored.some((directory) => isUnder(path, directory));
 }

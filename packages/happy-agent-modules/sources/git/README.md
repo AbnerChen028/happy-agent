@@ -58,8 +58,9 @@ directory and refs, while ref events fan out only to worktrees whose branch, ups
 `origin/main` comparison can change. Working trees are watched with `@parcel/watcher`: Watchman
 when it is installed, otherwise FSEvents, ReadDirectoryChangesW, or inotify. Directories Git
 ignores are excluded from the watch itself, which on Linux is what keeps `node_modules` from
-spending thousands of inotify watches, and the ignore list is re-derived when `.gitignore` changes
-or new directories appear. `watchWorkingTree` shares that one watch per folder with other modules.
+spending thousands of inotify watches. The ignore list is re-derived when `.gitignore` changes or
+new directories appear, and events from newly ignored directories are dropped; the native watch
+itself is never replaced, because a second subscription on an already-watched folder can go deaf. `watchWorkingTree` shares that one watch per folder with other modules.
 
 Working-tree events are debounced and first checked with a path-scoped status, so ignored build
 output does not schedule the full snapshot scan. Full rescans run two at a time on the module's own
