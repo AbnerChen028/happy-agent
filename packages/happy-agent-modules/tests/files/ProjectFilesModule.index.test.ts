@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { FileFinder } from "@ff-labs/fff-node";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { GitModule } from "../../sources/git/index.js";
+import { GitModule, type WorkingTreeObserver } from "../../sources/git/index.js";
 import { ProjectFilesModule, type ProjectFileRoot } from "../../sources/files/index.js";
 import type { ProjectsModule } from "../../sources/projects/index.js";
 import type { WorkspacesModule } from "../../sources/workspaces/index.js";
@@ -144,14 +144,44 @@ describe("ProjectFilesModule index", () => {
         );
     }, 30_000);
 
+    it("rescans once when its watch goes live after the first scan", async () => {
+        const root = await workspace();
+        await writeFile(join(root, "README.md"), "workspace");
+        // The watch arms asynchronously; a file created before it is live produces no event.
+        let observer: WorkingTreeObserver | undefined;
+        const git = {
+            invalidate: () => undefined,
+            markChanged: () => undefined,
+            watchWorkingTree: (_root: string, watching: WorkingTreeObserver) => {
+                observer = watching;
+                return () => undefined;
+            },
+        } as unknown as GitModule;
+        const files = new ProjectFilesModule({} as ProjectsModule, {} as WorkspacesModule, git);
+        modules.add(files);
+        const resolvedRoot = await fileRoot(root);
+        await files.search(resolvedRoot, { query: "readme" });
+
+        await writeFile(join(root, "before-watch.txt"), "unseen");
+        observer?.onWatching?.(true);
+
+        await vi.waitFor(async () => {
+            const result = await files.search(resolvedRoot, { query: "before-watch" });
+            expect(result.files.map((file) => file.path)).toContain("before-watch.txt");
+        });
+    });
+
     it("does not rescan an idle watched workspace however old its index is", async () => {
         const root = await workspace();
         await writeFile(join(root, "README.md"), "workspace");
         const files = createFiles();
         const resolvedRoot = await fileRoot(root);
         await files.search(resolvedRoot, { query: "readme" });
-        // Let the watch arm; the first search's scan is the only one this index needs.
+        // Let the watch arm. Going live rescans once, since the first scan predates the watch;
+        // after that an idle workspace needs no scan at all.
         await new Promise((resolve) => setTimeout(resolve, 500));
+        await files.search(resolvedRoot, { query: "readme" });
+        await new Promise((resolve) => setTimeout(resolve, 200));
         const scans = vi.spyOn(FileFinder.prototype, "scanFiles");
         const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60 * 60 * 1000);
         try {

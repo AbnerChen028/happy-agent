@@ -21,6 +21,10 @@ import type {
     GitChangeState,
     GitTrackedEntity,
 } from "../../sources/git/types.js";
+import {
+    WorkingTreeWatcher,
+    type WorkingTreeObserver,
+} from "../../sources/git/impl/WorkingTreeWatcher.js";
 import { cleanupRoots, commitFile, createRepository, gitRunner, setOriginMain } from "./helpers.js";
 
 const HEAD = "a".repeat(40);
@@ -180,6 +184,37 @@ describe("GitStateTracker scheduling", () => {
             await advance(GIT_RECONCILE_STALE_AFTER_MS);
             expect(scan.fullStatusReads).toBe(6);
             expect(scan.diffReads).toBe(2);
+        } finally {
+            tracker.dispose();
+        }
+    });
+
+    it("checks promptly and cheaply when the working-tree watch goes live", async () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(1_000);
+        const scan = testScan();
+        let observer: WorkingTreeObserver | undefined;
+        const tree = {
+            dispose: () => undefined,
+            watch: (_root: string, watching: WorkingTreeObserver) => {
+                observer = watching;
+                return () => undefined;
+            },
+        } as unknown as WorkingTreeWatcher;
+        const tracker = new GitStateTracker(createRootContext(), scan.run, owner(), tree);
+        try {
+            await startTracking(tracker);
+            expect(scan.fullStatusReads).toBe(1);
+
+            // Anything between the first scan and the watch going live produced no event.
+            observer?.onWatching?.(true);
+            await advance(1);
+            expect(scan.fullStatusReads).toBe(2);
+            expect(scan.diffReads).toBe(1);
+
+            // Once watched, the stale deadline relaxes to the watched interval.
+            await advance(GIT_RECONCILE_STALE_AFTER_MS);
+            expect(scan.fullStatusReads).toBe(2);
         } finally {
             tracker.dispose();
         }

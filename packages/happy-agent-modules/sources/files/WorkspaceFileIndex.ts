@@ -114,8 +114,8 @@ export class WorkspaceFileIndex {
                 const state = holder.state;
                 if (state === undefined) return;
                 state.watching = watching;
-                // Whatever happened while unwatched is unknown.
-                if (!watching) state.stale = true;
+                // Whatever happened before the watch went live, or after it stopped, is unknown.
+                state.stale = true;
             },
         });
         const state: FinderState = {

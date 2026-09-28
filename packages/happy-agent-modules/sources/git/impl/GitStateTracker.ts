@@ -68,6 +68,8 @@ interface RepositoryTracker {
     lastActiveAt: number;
     readonly pendingWorktreePaths: Set<string>;
     reconcileAt: number | undefined;
+    /** A stale check requested while a scan ran, applied once that scan settles. */
+    reconcileAfterScan: boolean;
     /** The wait before the next stale check, doubled each time a check finds nothing moved. */
     reconcileDelayMs: number;
     /** Whether the queued scan is only a stale check, which a matching fingerprint satisfies. */
@@ -209,6 +211,7 @@ export class GitStateTracker {
             lastActiveAt: Date.now(),
             pendingWorktreePaths: new Set(),
             reconcileAt: undefined,
+            reconcileAfterScan: false,
             reconcileDelayMs: GIT_RECONCILE_STALE_AFTER_MS,
             reconciling: false,
             scanController: undefined,
@@ -234,7 +237,12 @@ export class GitStateTracker {
 
     /** Brings a pending stale check forward; one already due sooner is left alone. */
     #reconcileBy(tracker: RepositoryTracker, at: number): void {
-        if (tracker.scanning || tracker.snapshot === undefined) return;
+        if (tracker.scanning) {
+            // The running scan may have read the tree before whatever prompted this check.
+            if (at <= Date.now()) tracker.reconcileAfterScan = true;
+            return;
+        }
+        if (tracker.snapshot === undefined) return;
         if (tracker.reconcileAt !== undefined && tracker.reconcileAt <= at) return;
         tracker.reconcileAt = at;
         this.#scheduleMaintenance();
@@ -440,7 +448,9 @@ export class GitStateTracker {
         if (tracker.treeWatching === watching) return;
         tracker.treeWatching = watching;
         tracker.reconcileDelayMs = this.#staleAfter(tracker);
-        if (!watching) this.#reconcileBy(tracker, Date.now() + tracker.reconcileDelayMs);
+        // A change between the last scan and the watch going live produced no event, so check
+        // now; the fingerprint makes that cheap when nothing moved.
+        this.#reconcileBy(tracker, Date.now() + (watching ? 0 : tracker.reconcileDelayMs));
     }
 
     #staleAfter(tracker: RepositoryTracker): number {
@@ -685,7 +695,10 @@ export class GitStateTracker {
         tracker.reconcileDelayMs = unchanged
             ? Math.min(staleAfter * IDLE_RECONCILE_FACTOR, tracker.reconcileDelayMs * 2)
             : staleAfter;
-        tracker.reconcileAt = Date.now() + tracker.reconcileDelayMs;
+        tracker.reconcileAt = tracker.reconcileAfterScan
+            ? Date.now()
+            : Date.now() + tracker.reconcileDelayMs;
+        tracker.reconcileAfterScan = false;
     }
 
     async #runScan(entity: GitTrackedEntity, signal?: AbortSignal): Promise<GitChangeState> {
