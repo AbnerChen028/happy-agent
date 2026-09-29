@@ -132,6 +132,20 @@ describe("Codex CLI configuration import", () => {
         );
     });
 
+    it("adds a name another vendor's part of the catalog happens to share", async () => {
+        const machine = await createMachine({
+            codexConfig: gatewayConfig.replace(
+                'model = "deepseek-flash"',
+                'model = "xai/grok-4.7"',
+            ),
+            happyToml: importingToml,
+        });
+        const module = await loadMachine(machine);
+
+        // A grok account's reviewed entry is not this route, so the gateway still gets its own.
+        expect(module.models[0]).toMatchObject({ id: "xai/grok-4.7", providerId: "codex" });
+    });
+
     it("reads nothing at all when no provider imports the Codex configuration", async () => {
         const machine = await createMachine({
             // Unreadable on purpose: an account that never opted in must not even open this file.

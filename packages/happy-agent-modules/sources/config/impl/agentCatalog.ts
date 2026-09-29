@@ -321,7 +321,14 @@ export function agentModelCatalog(
      * keeps that reviewed entry: the import adds what Happy Agent does not know, and restates
      * nothing it does.
      */
-    if (codexCli?.model !== undefined && !CATALOG.some((entry) => entry.id === codexCli.model)) {
+    /*
+     * Only a name the catalog reviews for Codex itself is already described. The same string under
+     * another vendor is a different route, so a gateway that serves it still gets its own entry.
+     */
+    const curatedCodexModels = new Set(
+        CATALOG.filter((entry) => entry.providerId === "codex").map((entry) => entry.id),
+    );
+    if (codexCli?.model !== undefined && !curatedCodexModels.has(codexCli.model)) {
         for (const [id, provider] of Object.entries(values.providers)) {
             if (provider.type !== "codex" || provider.importCodexConfig !== true) continue;
             concreteModels.push(
