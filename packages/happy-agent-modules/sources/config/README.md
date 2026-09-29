@@ -107,6 +107,14 @@ while `offeredModels` is the stable complete set the agent systems can accept af
 Happy Agent never asks a vendor which models exist — the list is source, and a configured provider
 entry decides which of them its own key serves.
 
+A codex account can also follow the route the Codex CLI itself is configured with. Setting
+`import_codex_config` on that account makes `impl/codexCliConfiguration.ts` read
+`$CODEX_HOME/config.toml` once while configuration loads, so the snapshot carries the endpoint,
+bearer token, model, and windows that file states. Anything `happy.toml` states still wins, and a
+Codex file that cannot be read refuses the load instead of leaving the replaced route running.
+Nothing is read for a machine that never opted in, and the import cannot raise the account's
+privileges: an account still needs its own credential to run at all.
+
 After startup, configuration renews enabled Codex and Grok session logins in the background,
 then repeats three hours after each completed pass. Hidden enabled accounts are included;
 disabled accounts, static API keys, smart routing aliases, Bedrock, and Claude are skipped.

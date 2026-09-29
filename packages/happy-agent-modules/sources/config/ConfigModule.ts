@@ -44,11 +44,13 @@ import {
     agentModelContext,
     agentModels,
     agentProviders,
+    codexCliSelectionFor,
     configuredAnthropicBedrockTransport,
     smartProviderRoute,
     type AgentModelContext,
     type ConfiguredAgentModel,
 } from "./impl/agentCatalog.js";
+import type { CodexCliProviderSelection } from "./impl/codexCliConfiguration.js";
 import { loadConfiguredProviderUsage } from "./impl/loadConfiguredProviderUsage.js";
 import { discoverGithubCliToken, githubTokenSchema } from "./impl/discoverGithubCliToken.js";
 import { ProviderEnablement, providerRegistryUntil } from "./impl/providerRegistryUntil.js";
@@ -278,6 +280,7 @@ const providerInputSchemas = {
             api_key: Type.Optional(configStringSchema),
             auth_file: Type.Optional(pathSchema),
             base_url: Type.Optional(configStringSchema),
+            import_codex_config: Type.Optional(Type.Boolean()),
             transport: Type.Optional(
                 Type.Union([
                     Type.Literal("auto"),
@@ -689,6 +692,7 @@ const providerSchemas = {
             apiKey: Type.Optional(configStringSchema),
             authFile: Type.Optional(pathSchema),
             baseUrl: Type.Optional(configStringSchema),
+            importCodexConfig: Type.Optional(Type.Boolean()),
             transport: Type.Optional(
                 Type.Union([
                     Type.Literal("auto"),
@@ -1297,6 +1301,8 @@ export class ConfigModule implements AgentModule {
 
     readonly #scripted: ConfigInferenceOverride | ConfigInferenceFactory | undefined;
     readonly #environment: Readonly<NodeJS.ProcessEnv>;
+    /** The Codex CLI configuration the opted-in accounts follow, read once for this daemon. */
+    readonly #codexCli: CodexCliProviderSelection | undefined;
     readonly #providerLifetime = new AbortController();
     #credentialRefreshStarted = false;
     readonly #providerEnabled = new Map<string, boolean>();
@@ -1488,12 +1494,14 @@ export class ConfigModule implements AgentModule {
         runtimeValues: PartialValues,
         scripted: ConfigInferenceOverride | ConfigInferenceFactory | undefined,
         environment: Readonly<NodeJS.ProcessEnv>,
+        codexCli: CodexCliProviderSelection | undefined,
     ) {
         this.configuration = configuration;
         this.#mcpServers = configuration.values.mcpServers;
         this.#runtimeValues = structuredClone(runtimeValues);
         this.#scripted = scripted;
         this.#environment = environment;
+        this.#codexCli = codexCli;
         this.#tailcatEnabled = configuration.values.feature.tailcat.enabled;
         this.#connections = structuredClone(configuration.values.connections ?? {});
         for (const id of Object.keys(configuration.values.providers)) {
@@ -1558,6 +1566,7 @@ export class ConfigModule implements AgentModule {
             },
             (id) => this.isProviderEnabled(id),
             (id) => this.#isAccountEnabled(id),
+            this.#codexCli,
         );
     }
 
@@ -1570,6 +1579,7 @@ export class ConfigModule implements AgentModule {
                 undefined,
                 () => true,
                 () => true,
+                this.#codexCli,
             )
         );
     }
@@ -1582,6 +1592,7 @@ export class ConfigModule implements AgentModule {
             this.configuration,
             (id) => this.isProviderEnabled(id),
             (id) => this.#isAccountEnabled(id),
+            this.#codexCli,
         ).filter((model) => !scriptedProviderIds.has(model.providerId));
         if (scripted !== undefined) {
             for (const model of scripted) {
@@ -2053,12 +2064,16 @@ export class ConfigModule implements AgentModule {
                     this.configuration,
                     (message) => this.#catalogNotices.push(message),
                     (id) => this.configuration.values.providers[id]?.enabled !== false,
+                    undefined,
+                    this.#codexCli,
                 ),
                 providers: agentProviders(
                     this.configuration,
                     undefined,
                     (id) => this.#isAccountEnabled(id),
                     (id) => this.#providerEnablement?.signal(id),
+                    undefined,
+                    this.#codexCli,
                 ),
             },
             this.configuration,
@@ -2096,6 +2111,7 @@ export class ConfigModule implements AgentModule {
                           (id) => this.#isAccountEnabled(id),
                           (id) => this.#providerEnablement?.signal(id),
                           scripted,
+                          this.#codexCli,
                       );
             // A test-owned inference registry is already authenticated. Initialize all its
             // accounts as usable, including canonical IDs whose production defaults are off. This
@@ -2377,12 +2393,31 @@ export class ConfigModule implements AgentModule {
         const localValues = withoutProjectMachineSettings(local.values);
         const globalValues = withoutMcpServers(global.values);
         const runtimeValues = withoutMcpServers(runtime.values);
-        const values = mergeValues(
+        const mergedValues = mergeValues(
             globalValues,
             withoutMcpServers(localValues),
             runtimeValues,
             mcp.values.mcp_servers === undefined ? {} : { mcp_servers: mcp.values.mcp_servers },
         );
+        /*
+         * An account that imports the Codex CLI's configuration is following a decision made
+         * somewhere else, so the model Codex runs becomes the model a session starts on. An
+         * explicit `[defaults] model` is still the person's own choice and wins; the derived value
+         * only fills a default nobody stated. A broken Codex file raises here, at startup, rather
+         * than leaving the machine quietly running the route the person thought they replaced.
+         */
+        const codexCli = codexCliSelectionFor(mergedValues.providers, {
+            ...process.env,
+            ...options.environment,
+        });
+        const values =
+            codexCli?.model !== undefined &&
+            !hasConfiguredDefaultModel(globalValues, localValues, runtimeValues)
+                ? {
+                      ...mergedValues,
+                      defaults: { ...mergedValues.defaults, modelId: codexCli.model },
+                  }
+                : mergedValues;
         const configuration = {
             paths,
             provenance: {
@@ -2407,6 +2442,7 @@ export class ConfigModule implements AgentModule {
             runtimeValues,
             options.inference,
             Object.freeze({ ...options.environment }),
+            codexCli,
         );
     }
 }
@@ -2827,6 +2863,17 @@ function resolveHappyHome(input: HappyAgentConfigurationInput): string {
     if (input === "~") return resolve(homedir());
     if (input.startsWith("~/")) return resolve(homedir(), input.slice(2));
     return resolve(input);
+}
+
+/**
+ * Whether any configuration layer names its own default model.
+ *
+ * `DEFAULT_VALUES` always supplies a model, so the merged snapshot alone cannot tell a person's
+ * choice from the built-in one. The per-layer partials can, and only that distinction decides
+ * whether an imported Codex model may replace the default.
+ */
+function hasConfiguredDefaultModel(...partials: readonly PartialValues[]): boolean {
+    return partials.some((partial) => partial.defaults?.model !== undefined);
 }
 
 function mergeValues(...partials: readonly PartialValues[]): HappyAgentConfigValues {
@@ -3331,6 +3378,9 @@ function normalizeProvider(id: string, value: Record<string, unknown>): Record<s
                 ...(value["api_key"] === undefined ? {} : { apiKey: value["api_key"] }),
                 ...(value["auth_file"] === undefined ? {} : { authFile: value["auth_file"] }),
                 ...(value["base_url"] === undefined ? {} : { baseUrl: value["base_url"] }),
+                ...(value["import_codex_config"] === undefined
+                    ? {}
+                    : { importCodexConfig: value["import_codex_config"] }),
                 ...(value["transport"] === undefined ? {} : { transport: value["transport"] }),
                 type: inferred,
             };

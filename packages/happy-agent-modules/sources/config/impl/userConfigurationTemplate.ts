@@ -138,6 +138,9 @@ export const HAPPY_TOML_TEMPLATE = `# Happy configuration for Happy Agent.
 # auth_file = "/absolute/path/to/auth.json"
 # base_url = "https://api.openai.com/v1"
 # transport = "auto"
+# Follow the provider, base URL, model, and credential the Codex CLI itself is configured with in
+# $CODEX_HOME/config.toml (or ~/.codex/config.toml). Settings written in this file still win.
+# import_codex_config = false
 # include_models = ["openai/gpt-5.6-sol"]
 # exclude_models = []
 # include_subagent_models = ["openai/gpt-5.6-terra"]

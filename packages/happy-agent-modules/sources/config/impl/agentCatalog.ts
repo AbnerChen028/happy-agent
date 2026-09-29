@@ -21,6 +21,10 @@ import {
     type ProviderUsage,
 } from "@slopus/happy-providers";
 import type { HappyAgentConfigValues, HappyAgentConfiguration } from "../ConfigModule.js";
+import {
+    readCodexCliConfiguration,
+    type CodexCliProviderSelection,
+} from "./codexCliConfiguration.js";
 import { RoundRobinRouterProvider } from "./RoundRobinRouterProvider.js";
 
 type ConfiguredProvider = HappyAgentConfigValues["providers"][string];
@@ -174,6 +178,58 @@ const BEDROCK_CATALOG: readonly CatalogAgentModel[] = [
 ];
 
 /**
+ * The window a Codex model falls back to when neither the curated catalog nor the Codex
+ * configuration describes it. Codex itself uses the same window for a model it does not know.
+ */
+const UNKNOWN_CODEX_CONTEXT_WINDOW = 272_000;
+
+/**
+ * Read the Codex CLI's own configuration, but only for a machine that asked for it.
+ *
+ * An import is machine state rather than a per-account setting, so every opted-in account reads
+ * the same file. Nothing is read when no codex-type provider sets `import_codex_config`, and the
+ * caller decides whether a read failure is fatal: configuration does, and refuses to load.
+ */
+export function codexCliSelectionFor(
+    providers: HappyAgentConfigValues["providers"],
+    env: Readonly<NodeJS.ProcessEnv> | undefined,
+): CodexCliProviderSelection | undefined {
+    const wanted = Object.values(providers).some(
+        (provider) => provider.type === "codex" && provider.importCodexConfig === true,
+    );
+    return wanted
+        ? readCodexCliConfiguration(env === undefined ? {} : { env: { ...env } })
+        : undefined;
+}
+
+/**
+ * One imported model, described from what the Codex configuration states about it.
+ *
+ * The reasoning ladder is Codex's own: an unknown model falls back to the ordinary Responses
+ * request shape, and these are the levels Codex offers on every route it can take. The window is
+ * whatever the file declares and otherwise the same fallback Codex applies to a model its own
+ * metadata does not cover, so nothing here claims a capability the vendor never stated.
+ */
+function importedCodexModel(
+    providerId: string,
+    modelId: string,
+    codexCli: CodexCliProviderSelection,
+    state: { readonly enabled: boolean },
+): ConfiguredAgentModel {
+    const contextWindow = codexCli.contextWindow ?? UNKNOWN_CODEX_CONTEXT_WINDOW;
+    return {
+        autoCompactWindow: codexCli.autoCompactWindow ?? Math.round(contextWindow * 0.9),
+        contextWindow,
+        defaultEffort: "medium",
+        effortLevels: ALL_BUT_OFF,
+        enabled: state.enabled,
+        id: modelId,
+        name: modelId,
+        providerId,
+    };
+}
+
+/**
  * Every model the configuration actually enables, with the configured default first.
  *
  * The order matters: the first entry is what a session gets when it names nothing. A configured
@@ -186,9 +242,15 @@ export function agentModels(
     onIgnored?: (message: string) => void,
     isProviderEnabled?: (id: string) => boolean,
     isAccountEnabled?: (id: string) => boolean,
+    codexCli?: CodexCliProviderSelection,
 ): readonly CatalogAgentModel[] {
     const values = configuration.values;
-    const available = agentModelCatalog(configuration, isProviderEnabled, isAccountEnabled)
+    const available = agentModelCatalog(
+        configuration,
+        isProviderEnabled,
+        isAccountEnabled,
+        codexCli,
+    )
         .filter((candidate) => candidate.enabled)
         .map(({ enabled: _enabled, ...candidate }) => candidate as CatalogAgentModel);
     const wantedModel = values.defaults.modelId;
@@ -236,6 +298,7 @@ export function agentModelCatalog(
         configuration.values.providers[id]?.hidden !== true,
     isAccountEnabled: (id: string) => boolean = (id) =>
         configuration.values.providers[id]?.enabled !== false,
+    codexCli?: CodexCliProviderSelection,
 ): readonly ConfiguredAgentModel[] {
     const concreteModels: ConfiguredAgentModel[] = [];
     const values = configuration.values;
@@ -250,6 +313,25 @@ export function agentModelCatalog(
                 provider.includeModels?.includes(candidate.id) !== false &&
                 provider.excludeModels?.includes(candidate.id) !== true;
             concreteModels.push({ ...candidate, enabled, providerId: id });
+        }
+    }
+    /*
+     * A gateway that serves its own model names has no curated entry to select, so the model the
+     * Codex CLI was pointed at is the only way to reach it. A name the catalog already reviews
+     * keeps that reviewed entry: the import adds what Happy Agent does not know, and restates
+     * nothing it does.
+     */
+    if (codexCli?.model !== undefined && !CATALOG.some((entry) => entry.id === codexCli.model)) {
+        for (const [id, provider] of Object.entries(values.providers)) {
+            if (provider.type !== "codex" || provider.importCodexConfig !== true) continue;
+            concreteModels.push(
+                importedCodexModel(id, codexCli.model, codexCli, {
+                    enabled:
+                        isProviderEnabled(id) &&
+                        provider.includeModels?.includes(codexCli.model) !== false &&
+                        provider.excludeModels?.includes(codexCli.model) !== true,
+                }),
+            );
         }
     }
     const models = [...concreteModels];
@@ -358,6 +440,7 @@ export function agentProviders(
     isProviderEnabled: (providerId: string) => boolean = () => true,
     providerSignal: (providerId: string) => AbortSignal | undefined = () => undefined,
     concreteProviders?: AgentProviders,
+    codexCli?: CodexCliProviderSelection,
 ): AgentProviders {
     const providers = new AgentProviders();
     const retryLimit = configuration.values.settings.inferenceMaxRetries;
@@ -382,7 +465,7 @@ export function agentProviders(
         providers.add(
             id,
             async ({ model: selected }) =>
-                await createProvider(id, provider, selected, retryLimit, onAccountUsage),
+                await createProvider(id, provider, selected, retryLimit, codexCli, onAccountUsage),
             provider.type,
         );
     }
@@ -476,6 +559,7 @@ async function createProvider(
     provider: ConcreteConfiguredProvider,
     selectedModel: string | undefined,
     retryLimit: number | undefined,
+    codexCli: CodexCliProviderSelection | undefined,
     onAccountUsage?: (usage: ProviderUsage) => void,
 ): Promise<BaseProvider> {
     // Credential isolation means this provider may use only what its own configuration names.
@@ -491,21 +575,32 @@ async function createProvider(
         value === undefined ? (ambient ? await discover() : null) : await fromValue(value);
 
     if (provider.type === "codex") {
-        const credential = ambient
-            ? await loadCodexCredential({
-                  ...(provider.apiKey === undefined ? {} : { apiKey: provider.apiKey }),
-                  ...(provider.authFile === undefined ? {} : { authFile: provider.authFile }),
-              })
-            : ((provider.apiKey === undefined
-                  ? null
-                  : await CodexApiKeyCredential.tryLoad({ apiKey: provider.apiKey })) ??
-              (provider.authFile === undefined
-                  ? null
-                  : await CodexSessionCredential.tryLoad({ authFile: provider.authFile })));
+        const imported = provider.importCodexConfig === true ? codexCli : undefined;
+        /*
+         * A gateway that declares `requires_openai_auth = false` is saying it answers to its own
+         * credential. Sending it this machine's ChatGPT login or OPENAI_API_KEY would hand the
+         * account to a third party that never asked for it, so that statement closes ambient
+         * discovery and the token the Codex CLI itself would send becomes the credential.
+         */
+        const acceptsOpenAiAuth = imported?.requiresOpenAiAuth !== false;
+        const explicitApiKey = provider.apiKey ?? imported?.bearerToken;
+        const credential =
+            ambient && acceptsOpenAiAuth
+                ? await loadCodexCredential({
+                      ...(explicitApiKey === undefined ? {} : { apiKey: explicitApiKey }),
+                      ...(provider.authFile === undefined ? {} : { authFile: provider.authFile }),
+                  })
+                : ((explicitApiKey === undefined
+                      ? null
+                      : await CodexApiKeyCredential.tryLoad({ apiKey: explicitApiKey })) ??
+                  (provider.authFile === undefined
+                      ? null
+                      : await CodexSessionCredential.tryLoad({ authFile: provider.authFile })));
+        const endpoint = provider.baseUrl ?? imported?.baseUrl;
         return new CodexProvider({
             credential: required(credential, "Codex", id),
             parallelToolCalls: true,
-            ...(provider.baseUrl === undefined ? {} : { endpoint: provider.baseUrl }),
+            ...(endpoint === undefined ? {} : { endpoint }),
             ...(provider.transport === undefined || provider.transport === "auto"
                 ? {}
                 : {

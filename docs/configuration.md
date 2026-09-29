@@ -15,7 +15,8 @@ private `.happy/agent` state does not move.
 Repository settings come only from `happy.toml`. Repository values win where
 both are allowed. MCP is separate: user-wide servers live in `~/Happy/Config/mcp.toml` on macOS
 or `~/happy/config/mcp.toml` on Linux, and a
-workspace can add servers in its root `mcp.toml`. Provider configuration files are not imported.
+workspace can add servers in its root `mcp.toml`. Provider configuration files are not imported,
+with the single opt-in exception of a codex account that sets `import_codex_config`.
 
 Happy Agent keeps daemon state in `~/.happy/agent`, including its databases, logs, and runtime
 configuration. A standalone deployment also keeps its private API token and socket there; team
@@ -483,6 +484,37 @@ below a skill of the same name in a standard root. Machine folders are scanned
 only when the agent runs on the daemon's own filesystem, since they name paths
 on this machine; a Docker or remote session sees only its project's folders.
 A missing or invalid project file adds nothing and hides nothing.
+
+### Following the Codex CLI's own configuration
+
+A machine that manages Codex providers somewhere else — a config-file switcher writing
+`~/.codex/config.toml`, for example — can make one `type = "codex"` account follow that file:
+
+```toml
+[providers.codex]
+enabled = true
+import_codex_config = true
+```
+
+The account then reads `$CODEX_HOME/config.toml`, or `~/.codex/config.toml` when `CODEX_HOME` is
+unset, and takes its route from the `[model_providers.<id>]` table `model_provider` names:
+
+- `base_url`, so inference leaves through the endpoint Codex is configured to use;
+- the bearer token Codex itself would send, from `experimental_bearer_token` or from the variable
+  `env_key` names;
+- `model`, which joins the catalog for this account and becomes the model a new session starts on;
+- `model_context_window` and `model_auto_compact_token_limit`, when the file states them.
+
+Anything `happy.toml` states still wins: an explicit `base_url`, `auth_file`, or `api_key` is never
+replaced, and a `[defaults] model` remains the default. A model the curated catalog already
+reviews keeps its reviewed reasoning ladder and window; a model it does not know joins the catalog
+with the fallback window and reasoning levels Codex itself applies to an unknown model.
+`requires_openai_auth = false` is taken as a statement about credentials and stops that account
+from using this machine's ChatGPT login or `OPENAI_API_KEY`; the account then needs a token of its
+own, and its absence is reported rather than filled in. A Codex file that cannot be read fails
+startup instead of quietly leaving the previous route in place. Restart the daemon after changing
+either file. Repository `happy.toml` files cannot enable this, and it applies only to codex
+accounts.
 
 ### Hiding providers
 

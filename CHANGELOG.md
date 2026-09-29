@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Added an opt-in `import_codex_config` setting on a codex provider. The account then follows the
+  Codex CLI's own `$CODEX_HOME/config.toml`: the `model_provider` base URL, the token Codex would
+  send, the configured `model`, and its declared context windows. `requires_openai_auth = false`
+  also stops that account from sending this machine's OpenAI credentials, and a Codex file that
+  cannot be read refuses the load instead of silently keeping the route it replaced.
 - Added required local-plugin author/category metadata and an authenticated, generation-bound PNG
   icon capability for local and remote `rig-connect` catalog clients. This is a hard protocol 5
   cut: older Happy clients are incompatible, legacy manifests without `author`, `category`, or a
