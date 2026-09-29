@@ -33,6 +33,7 @@ import {
     MAX_USAGE_TREE_SESSIONS,
     MAX_USAGE_TREE_TITLE_LENGTH,
     MAX_USAGE_TOKEN_COUNT,
+    MAX_USAGE_RUNS_PER_READ,
     MAX_USAGE_WINDOWS,
     usageAggregateQuerySchema,
     usageAgentIdSchema,
@@ -339,6 +340,29 @@ export class UsageModule implements AgentModule {
             throw new Error("Usage store returned invalid run usage.");
         }
         return cloneValue(summary);
+    }
+
+    /**
+     * Read the usage of several runs at once, in the order they were given.
+     *
+     * A history page holds many runs, so one grouped query answers for all of them instead of
+     * one `readRun` query per run. Each summary is exactly what `readRun` returns for that run.
+     */
+    async readRuns(
+        ctx: Context,
+        agentId: string,
+        runIds: readonly string[],
+    ): Promise<UsageRunSummary[]> {
+        this.#assertAgentAccess(ctx, agentId);
+        if (runIds.length > MAX_USAGE_RUNS_PER_READ) {
+            throw new Error(`Usage cannot read more than ${MAX_USAGE_RUNS_PER_READ} runs at once.`);
+        }
+        for (const runId of runIds) {
+            if (!Value.Check(usageRunIdSchema, runId)) {
+                throw new Error("Usage run ID is invalid.");
+            }
+        }
+        return await new UsageDatabase().runs(ctx, agentId, runIds);
     }
 
     /**

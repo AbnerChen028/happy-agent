@@ -151,18 +151,18 @@ describe("message history request tracing", () => {
         const ready = new Promise<void>((resolve) => {
             started = resolve;
         });
-        fixture.usage.readRun.mockImplementation(async (ctx, agentId, runId) => {
+        fixture.usage.readRuns.mockImplementation(async (ctx, agentId, runIds) => {
             await ctx.span("test.usage.read", async () => {
                 started();
                 await gate;
             });
-            return { agentId, runId, usage: {}, costUsd: null };
+            return runIds.map((runId) => ({ agentId, runId, usage: {}, costUsd: null }));
         });
         const loading = fixture.get("/v0/agents/activeagent/messages?limit=100&omitToolData=false");
         await ready;
         try {
             const root = fixture.spans.find((span) => span.name === "api.messages");
-            const usage = fixture.spans.find((span) => span.name === "api.messages.run_usage");
+            const usage = fixture.spans.find((span) => span.name === "api.messages.usage");
             expect(root?.ends).toBe(0);
             expect(usage?.ends).toBe(0);
             expect(fixture.spans.find((span) => span.name === "test.usage.read")?.parent).toBe(
@@ -176,17 +176,17 @@ describe("message history request tracing", () => {
             "api.messages",
             "api.messages.agent",
             "api.messages.history",
-            "api.messages.runs",
-            "api.messages.run_usage",
+            "api.messages.usage",
             "test.usage.read",
-            "api.messages.project_run",
+            "api.messages.project",
             "api.messages.serialize",
         ]);
         const root = fixture.spans[0];
         for (const name of [
             "api.messages.agent",
             "api.messages.history",
-            "api.messages.runs",
+            "api.messages.usage",
+            "api.messages.project",
             "api.messages.serialize",
         ]) {
             expect(fixture.spans.find((span) => span.name === name)?.parent).toBe(root);
@@ -194,6 +194,44 @@ describe("message history request tracing", () => {
         expect(fixture.spans.every((span) => span.ends === 1 && span.errors.length === 0)).toBe(
             true,
         );
+    });
+
+    it("reads every run's usage once and keeps the span count fixed as runs grow", async () => {
+        const fixture = await createFixture(true);
+        const runs = Array.from({ length: 41 }, (_, index) => ({
+            id: `run${index}`,
+            status: "completed",
+            reason: "completed",
+            startedAt: index,
+            endedAt: index + 1,
+            messages: [],
+        }));
+        fixture.history.runs.mockResolvedValue({ runs, pending: [], hasMore: true });
+        fixture.usage.readRuns.mockImplementation(async (_ctx, agentId, runIds) =>
+            runIds.map((runId) => ({
+                agentId,
+                runId,
+                usage: { codex: { model: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } } },
+                costUsd: null,
+            })),
+        );
+        const page = await fixture.get<{ runs: { id: string; usage: unknown }[] }>(
+            "/v0/agents/activeagent/messages",
+        );
+        expect(page.runs.map((run) => run.id)).toEqual(runs.map((run) => run.id));
+        expect(page.runs[40]?.usage).toEqual({
+            codex: { model: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } },
+        });
+        expect(fixture.usage.readRuns).toHaveBeenCalledTimes(1);
+        expect(fixture.usage.readRuns.mock.calls[0]?.[2]).toEqual(runs.map((run) => run.id));
+        expect(fixture.spans.map((span) => span.name)).toEqual([
+            "api.messages",
+            "api.messages.agent",
+            "api.messages.history",
+            "api.messages.usage",
+            "api.messages.project",
+            "api.messages.serialize",
+        ]);
     });
 
     it("ends failed history and request spans without changing the HTTP error", async () => {
@@ -328,12 +366,14 @@ async function createFixture(tracing = false) {
     };
     const usage = {
         onEvent: subscribe,
-        readRun: vi.fn(async (_ctx: Context, agentId: string, runId: string) => ({
-            agentId,
-            runId,
-            usage: {},
-            costUsd: null,
-        })),
+        readRuns: vi.fn(async (_ctx: Context, agentId: string, runIds: readonly string[]) =>
+            runIds.map((runId) => ({
+                agentId,
+                runId,
+                usage: {} as Record<string, unknown>,
+                costUsd: null,
+            })),
+        ),
     };
     const api = new ApiModule(
         passive as never,

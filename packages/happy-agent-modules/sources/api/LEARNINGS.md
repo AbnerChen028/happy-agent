@@ -1,12 +1,15 @@
 # API module learnings
 
-## Measure message-history latency before changing its queries
+## Message history reads a page in a fixed number of queries
 
-Static inspection found repeated reads but could not establish what dominated a slow history
-request. The messages handler now exposes nested timing spans for agent lookup, history, usage,
-projection, and serialization; History separates database reads from decoding and validation.
-Keep query behavior and the response contract unchanged while collecting that evidence. Trace
-instrumentation does not enable export on a deployed daemon or authorize its restart.
+The traced messages request showed width, not depth: one page of 41 short runs made 297 spans,
+because History counted and read each run separately and the handler read usage once per run.
+The handler now asks `UsageModule.readRuns` once for the whole page and projects every run in one
+span; History batches its own reads. The existence check reads only the agent's configuration
+and workspace instead of building a full agent resource. Keep the per-stage spans (agent,
+history, usage, projection, serialization) and the response unchanged; a stage that runs once per
+run is the regression to look for. Trace instrumentation does not enable export on a deployed
+daemon or authorize its restart.
 
 ## Shell names preserve command presentation
 

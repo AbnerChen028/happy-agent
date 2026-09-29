@@ -93,6 +93,8 @@ model a cost was actually spent on live on the records and are read through `rea
 - `readRun(ctx, agentId, runId)` — the bounded provider-then-model inference usage attributed to
   one exact run, including cache reads and writes. `costUsd` is `null` because the current provider
   contract does not report monetary cost; the module never estimates one.
+- `readRuns(ctx, agentId, runIds)` — the same summary as `readRun` for up to
+  `MAX_USAGE_RUNS_PER_READ` runs, answered by one grouped query and returned in the given order.
 - `aggregate(ctx, query?)` / `readAggregate` / `readAggregateUsage` — a bounded summary for one
   agent (`query.agentId` set) or the whole collection (`query.agentId` omitted). Only reachable
   from a non-agent context; an agent-scoped `ctx` cannot ask for the whole collection.

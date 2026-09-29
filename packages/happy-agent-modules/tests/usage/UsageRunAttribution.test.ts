@@ -191,6 +191,19 @@ describe("UsageModule run attribution", () => {
                 costUsd: null,
             });
 
+            await expect(
+                usage.readRuns(database.context, "agent-1", [
+                    secondRunId,
+                    "run-unknown",
+                    firstRunId,
+                ]),
+            ).resolves.toEqual([
+                await usage.readRun(database.context, "agent-1", secondRunId),
+                { agentId: "agent-1", runId: "run-unknown", usage: {}, costUsd: null },
+                await usage.readRun(database.context, "agent-1", firstRunId),
+            ]);
+            await expect(usage.readRuns(database.context, "agent-1", [])).resolves.toEqual([]);
+
             const restartedEvents = new EventsModule();
             await restartedEvents.beforeStart?.(database.context);
             const restartedUsage = new UsageModule(restartedEvents);
@@ -290,6 +303,12 @@ describe("UsageModule run attribution", () => {
             await expect(usage.readRun(childContext, "parent-agent", parentRunId)).rejects.toThrow(
                 "limited to the current agent",
             );
+            await expect(
+                usage.readRuns(database.context, "parent-agent", [childRunId, parentRunId]),
+            ).resolves.toMatchObject([{ usage: {} }, { runId: parentRunId }]);
+            await expect(
+                usage.readRuns(childContext, "parent-agent", [parentRunId]),
+            ).rejects.toThrow("limited to the current agent");
         } finally {
             database.close();
         }

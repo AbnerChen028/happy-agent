@@ -127,6 +127,73 @@ export class UsageDatabase {
         return structuredClone(summary);
     }
 
+    /** Every listed run's usage from one grouped pass, in the order the runs were given. */
+    async runs(
+        ctx: Context,
+        agentId: string,
+        runIds: readonly string[],
+    ): Promise<UsageRunSummary[]> {
+        for (const runId of runIds) {
+            if (!Value.Check(usageRunIdSchema, runId)) {
+                throw new Error("Usage run ID is invalid.");
+            }
+        }
+        const unique = [...new Set(runIds)];
+        const usageByRun = new Map<string, UsageRunBreakdown>(unique.map((runId) => [runId, {}]));
+        if (unique.length > 0) {
+            const rows = await agentDatabaseRows<Record<string, number | string | null>>(
+                ctx.db,
+                sql`SELECT run_id, ${PROVIDER} AS provider, ${MODEL} AS model,
+                           COALESCE(SUM(${INPUT_TOKENS}), 0) AS input,
+                           COALESCE(SUM(${OUTPUT_TOKENS}), 0) AS output,
+                           COALESCE(SUM(${CACHE_READ_TOKENS}), 0) AS cache_read,
+                           COALESCE(SUM(${CACHE_WRITE_TOKENS}), 0) AS cache_write,
+                           ${USAGE_INTEGRITY_COLUMNS}
+                    FROM ${sql.raw(RECORDS_TABLE)}
+                    WHERE agent_id = ${agentId}
+                      AND run_id IN (${sql.join(
+                          unique.map((runId) => sql`${runId}`),
+                          sql`, `,
+                      )})
+                      AND kind = 'inference' AND ${MODEL} IS NOT NULL
+                    GROUP BY run_id, provider, model
+                    ORDER BY run_id, provider, model`,
+            );
+            for (const row of rows) {
+                if (Number(row["inconsistent_duration"] ?? 0) > 0) {
+                    throw new Error(
+                        "Usage storage holds a record whose duration contradicts its span.",
+                    );
+                }
+                const tokens = {
+                    input: Number(row["input"] ?? 0),
+                    output: Number(row["output"] ?? 0),
+                    cacheRead: Number(row["cache_read"] ?? 0),
+                    cacheWrite: Number(row["cache_write"] ?? 0),
+                };
+                // Matches the single-run breakdown, which leaves out models that spent nothing.
+                if (Object.values(tokens).every((count) => count === 0)) continue;
+                const usage = usageByRun.get(String(row["run_id"])) as UsageRunBreakdown;
+                const provider = String(row["provider"]);
+                const models = usage[provider] ?? {};
+                models[String(row["model"])] = tokens;
+                usage[provider] = models;
+            }
+        }
+        const summaries = runIds.map<UsageRunSummary>((runId) => ({
+            agentId,
+            runId,
+            usage: structuredClone(usageByRun.get(runId) as UsageRunBreakdown),
+            costUsd: null,
+        }));
+        for (const summary of summaries) {
+            if (!Value.Check(usageRunSummarySchema, summary)) {
+                throw new Error("Usage database returned invalid run usage.");
+            }
+        }
+        return summaries;
+    }
+
     async modelUsage(ctx: Context, agentId: string): Promise<UsageRunBreakdown> {
         const rows = await agentDatabaseRows<{
             provider: string;

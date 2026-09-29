@@ -26,6 +26,8 @@ export const MAX_USAGE_WINDOWS = 8;
  * which the read is refused rather than quietly cut short and reported as complete.
  */
 export const MAX_USAGE_TREE_SESSIONS = 1_000;
+/** How many runs one batched run-usage read may cover, matching one history page of runs. */
+export const MAX_USAGE_RUNS_PER_READ = 500;
 export const MAX_USAGE_PAGE_SIZE = 100;
 export const MAX_USAGE_OUTPUT_CHARACTERS = 20_000;
 export const MAX_USAGE_AGENT_ID_LENGTH = 256;

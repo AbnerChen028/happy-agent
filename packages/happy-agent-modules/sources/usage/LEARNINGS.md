@@ -19,3 +19,10 @@ agent identity captured when it was constructed.
 
 Usage preserves a concrete tier ID reported by the agent context without interpreting it. Ordinary
 provider service has no tier and is omitted; clearing a tier happens before the usage boundary.
+
+## Page-sized run reads are one query
+
+A history page asked for each run's usage separately, adding one query and span per run.
+`readRuns` answers up to one history page of runs with a single grouped query and returns
+exactly what `readRun` would for each, in the given order, including empty usage for unknown
+runs. The same duration-integrity check and agent-access rule apply.

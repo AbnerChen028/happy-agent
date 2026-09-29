@@ -176,6 +176,73 @@ describe("HistoryModule run history", () => {
         }
     });
 
+    it("reads a page of many runs with a fixed number of queries", async () => {
+        const world = await setup("history-runs-batched");
+        try {
+            for (let index = 0; index < 70; index += 1) {
+                await acceptBatch(world, [accepted(`message-${index}`, "send")]);
+                await finishInference(world, `inference-${index}`, `answer ${index}`);
+                await world.historyHooks.afterAgentSettledTransact?.(
+                    world.database.context,
+                    world.scope,
+                    { loopId: "loop-a", settlementId: `settlement-${index}` },
+                );
+            }
+            const expectedRun = (index: number) => ({
+                id: `message-${index}`,
+                status: "completed",
+                messages: [
+                    expect.objectContaining({ recordId: `message-${index}` }),
+                    expect.objectContaining({ recordId: `inference-${index}` }),
+                ],
+            });
+
+            const { tracer, spans } = recordingTracer();
+            const ctx = withTracer(world.database.context, tracer);
+            const whole = await world.history.runs(ctx, "agent-a", { limit: 200 });
+            expect(whole.hasMore).toBe(false);
+            expect(whole.runs).toEqual(
+                Array.from({ length: 70 }, (_, index) =>
+                    expect.objectContaining(expectedRun(index)),
+                ),
+            );
+            // 70 candidates span two count batches; every other stage runs once for the page.
+            expect(spans.map((span) => span.name)).toEqual([
+                "history.runs.read",
+                "history.runs.anchor",
+                "history.runs.candidates",
+                "history.runs.count",
+                "history.runs.count",
+                "history.runs.messages",
+                "history.runs.messages.query",
+                "history.runs.messages.decode",
+                "history.runs.project",
+                "history.runs.pending",
+                "history.runs.validate",
+            ]);
+
+            const newest = await world.history.runs(world.database.context, "agent-a", {
+                limit: 50,
+            });
+            expect(newest.hasMore).toBe(true);
+            expect(newest.runs).toEqual(
+                Array.from({ length: 25 }, (_, index) =>
+                    expect.objectContaining(expectedRun(index + 45)),
+                ),
+            );
+            const older = await world.history.runs(world.database.context, "agent-a", {
+                before: "message-45",
+                limit: 50,
+            });
+            expect(older.hasMore).toBe(true);
+            expect(older.runs.map((run) => run.id)).toEqual(
+                Array.from({ length: 25 }, (_, index) => `message-${index + 20}`),
+            );
+        } finally {
+            world.database.close();
+        }
+    });
+
     it("never backfills an older pending message from later acceptance metadata", async () => {
         const world = await setup("history-author-absent");
         try {

@@ -110,6 +110,15 @@ earlier page exists. A previous cursor is emitted only when the selected first m
 an earlier matching record. Otherwise returning zero as its own predecessor makes bounded readers
 reject the page as stalled.
 
+## A run page costs queries per batch, not per run
+
+Short runs are common, so a 50-message page can span dozens of runs. Counting and reading each
+run separately made the query count grow with runs rather than messages. `runs()` now counts
+candidate runs in fixed batches with one grouped query each, stops at the limit as before, and
+reads every selected run's messages in one query split by run in memory. The anchor run of an
+`after` page is the only one narrowed to later positions. The oversized-run check happens on the
+counts, before any message is read.
+
 ## Visible message activity means human text or a final model response
 
 History reports the newest non-hidden `user` message with non-whitespace text immediately. An

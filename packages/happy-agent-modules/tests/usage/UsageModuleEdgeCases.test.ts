@@ -502,6 +502,9 @@ describe("UsageModule edge cases", () => {
             await expect(module.readRun(database.context, "agent-1", "run-1")).rejects.toThrow(
                 "duration",
             );
+            await expect(module.readRuns(database.context, "agent-1", ["run-1"])).rejects.toThrow(
+                "duration",
+            );
             await expect(module.readWindowUsage(database.context, [0])).rejects.toThrow("duration");
         });
     });

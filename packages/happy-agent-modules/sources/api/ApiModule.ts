@@ -146,7 +146,7 @@ import {
     type SseWriter,
     WebSocketDuplex,
 } from "../transport/index.js";
-import { UsageModule, type UsageCurrentContext } from "../usage/index.js";
+import { UsageModule, type UsageCurrentContext, type UsageRunSummary } from "../usage/index.js";
 import { UserInputModule, type UserInputEvent } from "../userInput/index.js";
 import {
     WorkspaceInputError,
@@ -3415,7 +3415,7 @@ export class ApiModule implements AgentModule {
             }
             const limit = integerParameter(url.searchParams.get("limit"), 50, 1, 500);
             const omitToolData = booleanParameter(url.searchParams.get("omitToolData"), false);
-            await ctx.span("api.messages.agent", (ctx) => this.#requireAgentResource(ctx, agentId));
+            await ctx.span("api.messages.agent", (ctx) => this.#requireAgent(ctx, agentId));
             const page = await ctx.span("api.messages.history", (ctx) =>
                 this.#history.runs(ctx, agentId, {
                     ...(before === undefined ? {} : { before }),
@@ -3423,26 +3423,29 @@ export class ApiModule implements AgentModule {
                     limit,
                 }),
             );
-            const runs = await ctx.span("api.messages.runs", (ctx) =>
-                Promise.all(
-                    page.runs.map(async (run) => {
-                        const runUsage = await ctx.span("api.messages.run_usage", (ctx) =>
-                            this.#usage.readRun(ctx, agentId, run.id),
-                        );
-                        return ctx.span("api.messages.project_run", () => ({
-                            id: run.id,
-                            status: run.status,
-                            reason: run.reason,
-                            startedAt: run.startedAt,
-                            endedAt: run.endedAt,
-                            usage: runUsage.usage,
-                            costUsd: runUsage.costUsd,
-                            messages: run.messages
-                                .filter((message) => !messageHiddenFromUser(message))
-                                .map((message) => messageResource(message, { omitToolData })),
-                        }));
-                    }),
+            const runUsage = await ctx.span("api.messages.usage", (ctx) =>
+                this.#usage.readRuns(
+                    ctx,
+                    agentId,
+                    page.runs.map((run) => run.id),
                 ),
+            );
+            const runs = ctx.span("api.messages.project", () =>
+                page.runs.map((run, index) => {
+                    const usage = runUsage[index] as UsageRunSummary;
+                    return {
+                        id: run.id,
+                        status: run.status,
+                        reason: run.reason,
+                        startedAt: run.startedAt,
+                        endedAt: run.endedAt,
+                        usage: usage.usage,
+                        costUsd: usage.costUsd,
+                        messages: run.messages
+                            .filter((message) => !messageHiddenFromUser(message))
+                            .map((message) => messageResource(message, { omitToolData })),
+                    };
+                }),
             );
             ctx.span("api.messages.serialize", () =>
                 sendJson(response, 200, {
@@ -3568,6 +3571,16 @@ export class ApiModule implements AgentModule {
             throw invalidRequest(
                 "The selected provider, model, effort, or service tier is unavailable.",
             );
+        }
+    }
+
+    /** Check that an agent exists as a resource without projecting its activity and subtasks. */
+    async #requireAgent(ctx: Context, agentId: string): Promise<void> {
+        if ((await this.#agentSystem().config(ctx, agentId)) === undefined) {
+            throw notFound("The agent was not found.");
+        }
+        if ((await this.#workspaceIdForAgent(ctx, agentId)) === undefined) {
+            throw notFound("The agent was not found.");
         }
     }
 
